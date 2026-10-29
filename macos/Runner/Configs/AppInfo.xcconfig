@@ -1,0 +1,7 @@
+PRODUCT_NAME = Pingo
+
+// The application's bundle identifier
+PRODUCT_BUNDLE_IDENTIFIER = com.jgsoft.pingolive
+
+// The copyright displayed in application information
+PRODUCT_COPYRIGHT = Copyright © 2026 JGSoft. All rights reserved.
