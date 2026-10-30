@@ -1,4 +1,4 @@
-import 'package:flutter/material.dart';
+﻿import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import '../core/app_theme_and_strings.dart';
@@ -655,3 +655,4 @@ class _CircleInviteScreenState extends State<CircleInviteScreen> {
     );
   }
 }
+

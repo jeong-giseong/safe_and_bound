@@ -1,4 +1,4 @@
-import 'dart:async';
+﻿import 'dart:async';
 import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
@@ -3411,3 +3411,4 @@ class _PinTailPainter extends CustomPainter {
   bool shouldRepaint(covariant _PinTailPainter oldDelegate) =>
       oldDelegate.color != color;
 }
+

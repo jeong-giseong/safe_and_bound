@@ -1,4 +1,4 @@
-import 'dart:ui' as ui;
+﻿import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
 
@@ -1068,3 +1068,4 @@ class AppStrings {
     return _dict[lang]?[key] ?? _dict['en']![key] ?? key;
   }
 }
+

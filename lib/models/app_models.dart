@@ -1,4 +1,4 @@
-import 'package:flutter/material.dart';
+﻿import 'package:flutter/material.dart';
 import 'package:latlong2/latlong.dart';
 
 class CircleInfo {
@@ -52,3 +52,4 @@ class SafePlaceData {
     required this.radiusMeters,
   });
 }
+
