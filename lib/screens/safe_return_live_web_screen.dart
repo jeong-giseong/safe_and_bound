@@ -1,4 +1,4 @@
-﻿import 'dart:async';
+import 'dart:async';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -69,7 +69,7 @@ class _SafeReturnLiveWebScreenState extends State<SafeReturnLiveWebScreen> {
     final roadPoints = await AppEngineService.instance.fetchRoadSnappedRoute(
       _currentPos,
       _destPos,
-      profile: 'walking',
+      
     );
     final addr = await AppEngineService.instance.fetchRoadAddress(_currentPos);
 

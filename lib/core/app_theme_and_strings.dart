@@ -1,8 +1,10 @@
-﻿import 'dart:ui' as ui;
+import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
 
 class AppConfig {
+  static const Color primaryPurple = Color(0xFF6C47FF);
+  
   static const String supabaseUrl = 'https://wgonnoaoputcwuewhnzl.supabase.co';
   static const String supabaseAnonKey =
       'sb_publishable_TmbmuSQBaJ6ScfcOEKRbEQ_i7Lh76KH';
@@ -918,6 +920,58 @@ class AppStrings {
       'demo_chip_off': 'Ẩn mẫu',
       'demo_member_1': 'Minh',
       'demo_member_2': 'Linh',
+      'q_where': '👋 Đang ở đâu?',
+      'q_otw': '🏃 Đang đến!',
+      'q_home': '🏠 Đã về nhà',
+      'q_call': '⚡ Gọi cho mình!',
+      'q_meal': '🍚 Ăn cơm chưa?',
+      'q_coffee': '☕ Gặp chút nhé?',
+      'q_lowbat': '🔋 Yếu pin',
+      'q_love': '❤️ Yêu bạn',
+      'reply_otw': '🏃 Trả lời: Đang đến',
+      'call_btn': 'Gọi',
+      'sms_btn': 'Nhắn tin',
+      'share_messenger_btn': '💬 Chia sẻ lời mời',
+      'share_sms_btn': '✉️ Gửi mã qua SMS',
+      'copy_invite_btn': '📋 Sao chép mã',
+            'route_points_unit': '개 지점',
+      'sub_legal_notice': '구독은 현재 기간 종료 최소 24시간 전에 해지하지 않으면 자동 갱신됩니다. 계정 설정에서 언제든 해지할 수 있습니다.',
+      'map_style_light': '기본 밝은 지도',
+      'map_style_street': '선명한 도로 지도',
+      'map_style_dark': '야간 다크 지도',
+      'mute_alerts_on': '🔕 일반 알림 무음 (SOS만 수신)',
+      'mute_alerts_off': '🔔 모든 알림 및 진동 켜짐',
+      'circle_hidden_badge': '🔒 위치 공유 일시중지됨',
+      'offline_cached_badge': '📡 오프라인 - 마지막 저장된 위치 표시 중',
+      'fit_all_members': '전체 멤버 한눈에 보기',
+      'search_member_hint': '멤버 이름 검색...',
+      'filter_all': '전체',
+      'filter_moving': '이동 중',
+      'filter_safe': '안심 구역',
+      'filter_low_bat': '배터리 부족',
+      'demo_toggle_label': '🧪 혼자일 때 체험용 데모 멤버 표시',
+      'report_reason_title': '신고 및 차단 사유 선택',
+      'report_reason_1': '스팸 또는 부적절한 프로필 이름',
+      'report_reason_2': '원치 않는 위치 공유 / 프라이버시 침해',
+      'report_reason_3': '사칭 또는 불쾌한 사용자 활동',
+      'sos_cleared_banner': '님이 SOS 위급 상황을 안전하게 해제했습니다.',
+      'battery_low_alert': '님의 배터리가 15% 이하입니다! 마지막 위치를 확인하세요.',
+      'max_speed_label': '최고 속도',
+      'invite_auto_msg': '[Pingo] Tham gia nhóm vị trí! Mã mời: [{CODE}]\nTải ứng dụng: https://play.google.com/store/apps/details?id=com.jgsoft.pingolive',
+      'phone_input_title': 'Liên kết số điện thoại',
+      'phone_input_hint': 'Nhập số điện thoại để gọi nhanh',
+      'phone_save_call': 'Lưu & Kết nối',
+      'my_phone_hint': 'Số điện thoại của tôi (Tùy chọn)',
+      'bubble_mode_title': '🫧 Chế độ Bong bóng riêng tư',
+      'bubble_mode_on_desc': 'Chỉ chia sẻ bán kính 600m',
+      'bubble_mode_off_desc': 'Đang chia sẻ vị trí chính xác',
+      'bubble_masked_addr': '🫧 Trong vùng bong bóng riêng tư',
+      'place_arrived_alert': '🏠 Đã đến [{PLACE}]',
+      'place_left_alert': '🚶 Đã rời [{PLACE}]',
+      'sos_clear_btn': '✅ Tắt SOS',
+      'sos_cleared_toast': '🟢 Đã tắt cảnh báo SOS.',
+      'my_timeline_btn': 'Lộ trình của tôi',
+      'share_circle_banner': 'Chia sẻ mã nhóm với gia đình & bạn bè để kết nối',
     },
     'th': {
       'app_title': 'Pingo',

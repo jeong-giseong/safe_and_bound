@@ -1,5 +1,6 @@
-﻿import 'dart:async';
-import 'dart:math' as math;
+import 'dart:convert';
+import 'package:share_plus/share_plus.dart';
+import 'dart:async';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -55,14 +56,19 @@ class _MainLife360MapScreenState extends State<MainLife360MapScreen>
   bool _selectedYearlyPlan = true;
 
   String? selectedMemberId;
-  bool isPttRecording = false;
-  String pttTargetName = '';
-  double pttRemainingSec = 3.0;
-  Timer? _pttCountdownTimer;
+  bool isMySosActive = false;
 
+  // 상대방 머리 위 말풍선 & 상단 인터랙티브 원탭 답장 다이내믹 배너 상태
   final Map<String, String> _activeMemberBubblePings = {};
   final Set<String> _blockedMemberIds = {};
+  final Set<String> _insidePlaceIds = {};
+  final Set<String> _otherBubbleMemberIds = {};
+  final Map<String, ImageProvider> _avatarMemoryCache = {};
 
+  String? _incomingBannerSenderId;
+  String? _incomingBannerSenderName;
+  String? _incomingBannerText;
+  Timer? _incomingBannerTimer;
   bool isSyncingGps = false;
   bool isProUser = false;
 
@@ -81,9 +87,14 @@ class _MainLife360MapScreenState extends State<MainLife360MapScreen>
   CircleInfo get activeCircle => myCircles[currentCircleIndex];
 
   List<MemberData> get visibleMembers {
+    final isReviewerCircle = activeCircle.code == '999999';
     return _allMembers.where((m) {
       if (_blockedMemberIds.contains(m.id)) return false;
-      if (!_showDemoMembers && (m.id == 'm2' || m.id == 'm3')) return false;
+      if (!_showDemoMembers &&
+          !isReviewerCircle &&
+          (m.id == 'm2' || m.id == 'm3')) {
+        return false;
+      }
       return true;
     }).toList();
   }
@@ -147,18 +158,15 @@ class _MainLife360MapScreenState extends State<MainLife360MapScreen>
       ),
     ];
 
-    safePlaces = [
-      SafePlaceData(
-        id: 'p1',
-        name: AppStrings.t('default_home'),
-        iconData: Icons.home_rounded,
-        point: const LatLng(37.7599, 126.7802),
-        radiusMeters: 220,
-      ),
-    ];
+    safePlaces = [];
 
     _readRealBattery();
+    _readRealBattery();
     _subscribeToSupabaseRealtimeLocations();
+    AppEngineService.instance.cleanupDuplicateGhostRows(
+      circleCode: activeCircle.code,
+      myUserName: widget.userName,
+    );
 
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _autoCenterToMyRealLocationOnLaunch();
@@ -169,13 +177,12 @@ class _MainLife360MapScreenState extends State<MainLife360MapScreen>
   void dispose() {
     _pulseController.dispose();
     _sheetController.dispose();
-    _pttCountdownTimer?.cancel();
+    _incomingBannerTimer?.cancel();
     _realtimeLocationSub?.cancel();
     _myGpsPositionSub?.cancel();
     _placeNameController.dispose();
     super.dispose();
   }
-
   Future<void> _autoCenterToMyRealLocationOnLaunch() async {
     try {
       LocationPermission perm = await Geolocator.checkPermission();
@@ -244,12 +251,21 @@ class _MainLife360MapScreenState extends State<MainLife360MapScreen>
   }
 
   void _toggleDemoFamilyMode() {
-    HapticFeedback.mediumImpact();
+    HapticFeedback.selectionClick();
+    final myPos = _allMembers[0].location;
     setState(() {
       _showDemoMembers = !_showDemoMembers;
       if (_showDemoMembers && _allMembers.length >= 3) {
-        _allMembers[1].name = AppStrings.t('demo_member_1');
-        _allMembers[2].name = AppStrings.t('demo_member_2');
+        _allMembers[1].location = LatLng(
+          myPos.latitude + 0.0032,
+          myPos.longitude - 0.0021,
+        );
+        _allMembers[1].recentRoute = [_allMembers[1].location];
+        _allMembers[2].location = LatLng(
+          myPos.latitude - 0.0028,
+          myPos.longitude + 0.0035,
+        );
+        _allMembers[2].recentRoute = [_allMembers[2].location];
       }
       if (!_showDemoMembers &&
           (selectedMemberId == 'm2' || selectedMemberId == 'm3')) {
@@ -258,57 +274,64 @@ class _MainLife360MapScreenState extends State<MainLife360MapScreen>
     });
     if (_showDemoMembers) {
       _initRealRoadAddressesAndRoutes();
+      _mapController.move(myPos, 14.8);
     }
   }
 
   Widget _buildMemberAvatarImage(MemberData m, {double size = 46}) {
+    final url = m.avatarUrl;
+    if (url.startsWith('data:image')) {
+      try {
+        ImageProvider? provider = _avatarMemoryCache[url];
+        if (provider == null) {
+          final comma = url.indexOf(',');
+          final bytes = base64Decode(url.substring(comma + 1));
+          provider = MemoryImage(bytes);
+          _avatarMemoryCache[url] = provider;
+        }
+        return ClipOval(
+          child: Image(
+            image: provider,
+            width: size,
+            height: size,
+            fit: BoxFit.cover,
+            gaplessPlayback: true,
+          ),
+        );
+      } catch (_) {}
+    }
     return ClipOval(
       child: Image.network(
-        m.avatarUrl,
+        url,
         width: size,
         height: size,
         fit: BoxFit.cover,
-        errorBuilder: (_, __, ___) => Container(
+        errorBuilder: (_, _, _) => Container(
           width: size,
           height: size,
-          decoration: BoxDecoration(
-            gradient: LinearGradient(colors: m.gradient),
-          ),
-          child: Center(
-            child: Text(
-              m.monogram,
-              style: const TextStyle(
-                color: Colors.white,
-                fontWeight: FontWeight.bold,
-                fontSize: 13,
-              ),
+          color: AppColors.primaryPurple,
+          alignment: Alignment.center,
+          child: Text(
+            m.monogram,
+            style: TextStyle(
+              color: Colors.white,
+              fontWeight: FontWeight.bold,
+              fontSize: size * 0.36,
             ),
           ),
         ),
       ),
     );
   }
-
   Future<void> _initRealRoadAddressesAndRoutes() async {
     for (int i = 0; i < _allMembers.length; i++) {
       final addr = await AppEngineService.instance.fetchRoadAddress(
         _allMembers[i].location,
       );
-      final startPoint = LatLng(
-        _allMembers[i].location.latitude - 0.0042,
-        _allMembers[i].location.longitude - 0.0035,
-      );
-      final snappedRoute = await AppEngineService.instance
-          .fetchRoadSnappedRoute(
-            startPoint,
-            _allMembers[i].location,
-            profile: i == 2 ? 'driving' : 'walking',
-          );
-
       if (!mounted) return;
       setState(() {
         _allMembers[i].statusText = '$addr • ${AppStrings.t('just_now')}';
-        _allMembers[i].recentRoute = snappedRoute;
+        _allMembers[i].recentRoute = [_allMembers[i].location];
       });
     }
   }
@@ -349,30 +372,97 @@ class _MainLife360MapScreenState extends State<MainLife360MapScreen>
               ];
             });
 
-            for (final place in safePlaces) {
-              final dist = AppEngineService.instance.calculateDistanceMeters(
-                newLatLng,
-                place.point,
-              );
-              if (dist <= place.radiusMeters && speedKmh < 10.0) {
-                setState(() {
-                  _allMembers[0].statusIcon = place.iconData;
-                  _allMembers[0].statusText =
-                      '$addr • ${place.name} (${AppStrings.t('inside_safe_zone')})';
-                });
+              // 자동 장소 알림 (Place Alerts / Geofencing: 진입 150m / 이탈 +30m 완충)
+              for (final place in safePlaces) {
+                final dist = AppEngineService.instance.calculateDistanceMeters(
+                  newLatLng,
+                  place.point,
+                );
+                final wasInside = _insidePlaceIds.contains(place.id);
+                if (dist <= place.radiusMeters && !wasInside) {
+                  _insidePlaceIds.add(place.id);
+                  final alertText = AppStrings.t('place_arrived_alert')
+                      .replaceAll('{PLACE}', place.name);
+                  setState(() {
+                    _allMembers[0].statusIcon = place.iconData;
+                    _allMembers[0].statusText =
+                        '$addr • ${place.name} (${AppStrings.t('inside_safe_zone')})';
+                    _activeMemberBubblePings['m1'] = alertText;
+                  });
+                  await AppEngineService.instance.pushLiveLocationToServer(
+                    circleCode: activeCircle.code,
+                    userName: _allMembers[0].name,
+                    point: newLatLng,
+                    battery: _allMembers[0].battery,
+                    avatarUrl: _allMembers[0].avatarUrl,
+                    audioClipDataUrl:
+                        'PLACE::$alertText::${DateTime.now().millisecondsSinceEpoch}',
+                    speedKmh: speedKmh,
+                  );
+                } else if (dist > place.radiusMeters + 30.0 && wasInside) {
+                  _insidePlaceIds.remove(place.id);
+                  final leftText = AppStrings.t('place_left_alert')
+                      .replaceAll('{PLACE}', place.name);
+                  setState(() {
+                    _activeMemberBubblePings['m1'] = leftText;
+                  });
+                  await AppEngineService.instance.pushLiveLocationToServer(
+                    circleCode: activeCircle.code,
+                    userName: _allMembers[0].name,
+                    point: newLatLng,
+                    battery: _allMembers[0].battery,
+                    avatarUrl: _allMembers[0].avatarUrl,
+                    audioClipDataUrl:
+                        'PLACE::$leftText::${DateTime.now().millisecondsSinceEpoch}',
+                    speedKmh: speedKmh,
+                  );
+                }
               }
-            }
 
-            await AppEngineService.instance.pushLiveLocationToServer(
-              circleCode: activeCircle.code,
-              userName: _allMembers[0].name,
-              point: newLatLng,
-              battery: _allMembers[0].battery,
-              avatarUrl: _allMembers[0].avatarUrl,
-              speedKmh: speedKmh,
-            );
-          });
+              await AppEngineService.instance.pushLiveLocationToServer(
+                circleCode: activeCircle.code,
+                userName: _allMembers[0].name,
+                point: newLatLng,
+                battery: _allMembers[0].battery,
+                avatarUrl: _allMembers[0].avatarUrl,
+                speedKmh: speedKmh,
+                isSos: isMySosActive,
+              );
+            });
     } catch (_) {}
+  }
+
+  final Map<String, String> _lastProcessedIncomingSignal = {};
+
+  String _resolveIncomingSignalText(String rawKeyOrText) {
+    if (rawKeyOrText.startsWith('q_')) {
+      return AppStrings.t(rawKeyOrText);
+    }
+    return rawKeyOrText;
+  }
+
+  void _triggerIncomingDynamicBanner({
+    required String senderId,
+    required String senderName,
+    required String messageText,
+  }) {
+    HapticFeedback.heavyImpact();
+    _incomingBannerTimer?.cancel();
+    setState(() {
+      _activeMemberBubblePings[senderId] = messageText;
+      _incomingBannerSenderId = senderId;
+      _incomingBannerSenderName = senderName;
+      _incomingBannerText = messageText;
+    });
+    _incomingBannerTimer = Timer(const Duration(seconds: 8), () {
+      if (!mounted) return;
+      setState(() {
+        _activeMemberBubblePings.remove(senderId);
+        if (_incomingBannerSenderId == senderId) {
+          _incomingBannerSenderId = null;
+        }
+      });
+    });
   }
 
   void _subscribeToSupabaseRealtimeLocations() {
@@ -384,8 +474,14 @@ class _MainLife360MapScreenState extends State<MainLife360MapScreen>
             if (!mounted || rows.isEmpty) return;
             for (final row in rows) {
               final uid = row['user_id']?.toString();
+              final uName =
+                  row['user_name']?.toString() ??
+                  AppStrings.t('default_member_name');
+
+              // 본인 ID이거나 본인 닉네임과 동일한 과거 유령 행(Row)은 완벽 차단!
               if (uid == null ||
-                  uid == AppEngineService.instance.currentUserId) {
+                  uid == AppEngineService.instance.currentUserId ||
+                  uName.trim() == _allMembers[0].name.trim()) {
                 continue;
               }
               if (_blockedMemberIds.contains(uid)) continue;
@@ -401,16 +497,33 @@ class _MainLife360MapScreenState extends State<MainLife360MapScreen>
               final lng = (row['longitude'] as num?)?.toDouble();
               final bat = (row['battery_level'] as num?)?.toInt() ?? 88;
               final spd = (row['speed_kmh'] as num?)?.toDouble() ?? 0.0;
-              final uName =
-                  row['user_name']?.toString() ??
-                  AppStrings.t('default_member_name');
+              final isRowSos = row['is_sos'] == true;
               final uAvatar =
                   row['avatar_url']?.toString() ??
                   PingoAvatars.presets[1]['url']!;
-              final incomingAudio = row['audio_clip']?.toString();
+              final incomingSignal = row['audio_clip']?.toString();
 
               if (lat == null || lng == null) continue;
               final newPoint = LatLng(lat, lng);
+
+              // 상대방 버블 프라이버시 상태 및 전화번호 메타데이터 파싱
+              final bool isRemoteBubble =
+                  incomingSignal != null && incomingSignal.startsWith('BUBBLE::ON');
+              if (isRemoteBubble) {
+                _otherBubbleMemberIds.add(uid);
+                final bParts = incomingSignal.split('::');
+                if (bParts.length >= 3 && bParts[2] != '0' && bParts[2].isNotEmpty) {
+                  AppEngineService.instance.memberPhones[uid] = bParts[2];
+                }
+              } else {
+                _otherBubbleMemberIds.remove(uid);
+                if (incomingSignal != null && incomingSignal.startsWith('META::PHONE::')) {
+                  final ph = incomingSignal.replaceFirst('META::PHONE::', '').trim();
+                  if (ph.isNotEmpty) {
+                    AppEngineService.instance.memberPhones[uid] = ph;
+                  }
+                }
+              }
 
               setState(() {
                 final existIdx = _allMembers.indexWhere((m) => m.id == uid);
@@ -420,11 +533,27 @@ class _MainLife360MapScreenState extends State<MainLife360MapScreen>
                   _allMembers[existIdx].battery = bat;
                   _allMembers[existIdx].speedKmh = spd;
                   _allMembers[existIdx].avatarUrl = uAvatar;
-                  _allMembers[existIdx].recentRoute = [
-                    ..._allMembers[existIdx].recentRoute,
-                    newPoint,
-                  ];
+                  if (isRemoteBubble) {
+                    _allMembers[existIdx].statusText =
+                        AppStrings.t('bubble_masked_addr');
+                  }
+                  if (_allMembers[existIdx].recentRoute.isEmpty) {
+                    _allMembers[existIdx].recentRoute = [newPoint];
+                  } else {
+                    final lastPt = _allMembers[existIdx].recentRoute.last;
+                    if (AppEngineService.instance.calculateDistanceMeters(
+                          lastPt,
+                          newPoint,
+                        ) >=
+                        15.0) {
+                      _allMembers[existIdx].recentRoute = [
+                        ..._allMembers[existIdx].recentRoute,
+                        newPoint,
+                      ];
+                    }
+                  }
                 } else {
+                  // 새로운 가족이 합류했을 때 내 위치도 즉시 재전송하여 양방향 동기화 보장
                   _allMembers.add(
                     MemberData(
                       id: uid,
@@ -440,110 +569,283 @@ class _MainLife360MapScreenState extends State<MainLife360MapScreen>
                       statusIcon: spd >= 15
                           ? Icons.directions_car_rounded
                           : Icons.person_pin_circle_rounded,
-                      statusText: AppStrings.t('just_now'),
+                      statusText: isRemoteBubble
+                          ? AppStrings.t('bubble_masked_addr')
+                          : AppStrings.t('just_now'),
                       battery: bat,
                       speedKmh: spd,
                       location: newPoint,
                       recentRoute: [newPoint],
                     ),
                   );
-                  AppEngineService.instance.fetchRoadAddress(newPoint).then((
-                    resolvedAddr,
-                  ) {
-                    if (!mounted) return;
-                    final idx = _allMembers.indexWhere((m) => m.id == uid);
-                    if (idx != -1) {
-                      setState(() {
-                        _allMembers[idx].statusText =
-                            '$resolvedAddr • ${AppStrings.t('just_now')}';
-                      });
-                    }
-                  });
+                  if (!isRemoteBubble) {
+                    AppEngineService.instance.fetchRoadAddress(newPoint).then((
+                      resolvedAddr,
+                    ) {
+                      if (!mounted) return;
+                      final idx = _allMembers.indexWhere((m) => m.id == uid);
+                      if (idx != -1 && !_otherBubbleMemberIds.contains(uid)) {
+                        setState(() {
+                          _allMembers[idx].statusText =
+                              '$resolvedAddr • ${AppStrings.t('just_now')}';
+                        });
+                      }
+                    });
+                  }
                 }
               });
 
-              if (incomingAudio != null && incomingAudio.isNotEmpty) {
-                AppEngineService.instance.playVoiceSource(incomingAudio);
+              // 상대방 SOS 수신 시 즉시 카메라 이동 및 긴급 배너 표시
+              if (isRowSos &&
+                  _lastProcessedIncomingSignal['SOS_$uid'] != 'ACTIVE') {
+                _lastProcessedIncomingSignal['SOS_$uid'] = 'ACTIVE';
+                _mapController.move(newPoint, 16.0);
+                _triggerIncomingDynamicBanner(
+                  senderId: uid,
+                  senderName: uName,
+                  messageText: '🚨 SOS! ${AppStrings.t('sos_Active_banner')}',
+                );
+              } else if (!isRowSos) {
+                _lastProcessedIncomingSignal.remove('SOS_$uid');
+              }
+
+              // 실시간 이모지 퀵 노트(PING) / 체크인(CHECKIN) / 장소알림(PLACE) 수신 처리 (35초 이내 최신 신호만 울림)
+              if (incomingSignal != null &&
+                  incomingSignal.isNotEmpty &&
+                  !incomingSignal.startsWith('BUBBLE::') &&
+                  !incomingSignal.startsWith('META::') &&
+                  _lastProcessedIncomingSignal[uid] != incomingSignal) {
+                _lastProcessedIncomingSignal[uid] = incomingSignal;
+
+                final parts = incomingSignal.split('::');
+                if (parts.length >= 2) {
+                  final rawMsg = parts[1];
+                  final ts = parts.length >= 3 ? int.tryParse(parts[2]) : null;
+                  final nowMs = DateTime.now().millisecondsSinceEpoch;
+                  // 과거에 쌓인 오래된 신호가 뒷북으로 울리는 현상 원천 차단 (35초 유효기간)
+                  if (ts == null || (nowMs - ts).abs() <= 35000) {
+                    if (parts.length >= 4 && parts[3].isNotEmpty) {
+                      AppEngineService.instance.memberPhones[uid] = parts[3];
+                    }
+                    final displayMsg = _resolveIncomingSignalText(rawMsg);
+                    if (displayMsg.isNotEmpty) {
+                      _triggerIncomingDynamicBanner(
+                        senderId: uid,
+                        senderName: uName,
+                        messageText: displayMsg,
+                      );
+                    }
+                  }
+                }
               }
             }
           });
     } catch (_) {}
   }
 
-  Future<void> _startPttRecording(String targetName, String memberId) async {
-    HapticFeedback.heavyImpact();
-    _pttCountdownTimer?.cancel();
-    setState(() {
-      isPttRecording = true;
-      pttTargetName = targetName;
-      pttRemainingSec = 3.0;
-    });
-
-    await AppEngineService.instance.startRealPttVoiceRecording();
-
-    _pttCountdownTimer = Timer.periodic(const Duration(milliseconds: 100), (
-      timer,
-    ) {
-      if (!mounted) return;
-      setState(() {
-        pttRemainingSec = (pttRemainingSec - 0.1).clamp(0.0, 3.0);
-      });
-      if (pttRemainingSec <= 0) {
-        _stopAndSendPttRecording(memberId);
-      }
-    });
-  }
-
-  Future<void> _stopAndSendPttRecording(String memberId) async {
-    if (!isPttRecording) return;
-    _pttCountdownTimer?.cancel();
+  // 파스텔 그라데이션 이모지 퀵 노트 전송 + 데모 모드일 때 2초 뒤 상대방 자동 답장 시뮬레이션!
+  Future<void> _sendQuickPingToMember(
+    MemberData target,
+    String pingKeyOrText,
+  ) async {
     HapticFeedback.mediumImpact();
-
+    final displayText = _resolveIncomingSignalText(pingKeyOrText);
     setState(() {
-      isPttRecording = false;
-      _activeMemberBubblePings[memberId] = AppStrings.t('ptt_arrived_bubble');
+      _activeMemberBubblePings[target.id] = displayText;
     });
+    _mapController.move(target.location, 15.3);
 
-    final audioDataUrl = await AppEngineService.instance
-        .stopAndPlayRealPttVoice();
-
+    final pingPayload =
+        'PING::$pingKeyOrText::${DateTime.now().millisecondsSinceEpoch}::${AppEngineService.instance.myPhoneNumber}';
     await AppEngineService.instance.pushLiveLocationToServer(
       circleCode: activeCircle.code,
       userName: _allMembers[0].name,
       point: _allMembers[0].location,
       battery: _allMembers[0].battery,
       avatarUrl: _allMembers[0].avatarUrl,
-      audioClipDataUrl: audioDataUrl,
+      audioClipDataUrl: pingPayload,
       speedKmh: _allMembers[0].speedKmh,
+      isSos: isMySosActive,
     );
 
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
         backgroundColor: AppColors.primaryPurple,
-        content: Text('🎙️ ${AppStrings.t('ptt_sent_toast')}'),
+        behavior: SnackBarBehavior.floating,
+        content: Text('✨ ${target.name} ➔ $displayText'),
         duration: const Duration(seconds: 2),
       ),
     );
 
-    Future.delayed(const Duration(seconds: 5), () {
-      if (mounted) {
-        setState(() => _activeMemberBubblePings.remove(memberId));
-      }
-    });
+    // [스마트 데모 에코 시뮬레이터]: 샘플 캐릭터(m2, m3)에게 보내면 2초 뒤 나에게 이모지 답장을 자동으로 쏴줌!
+    if (target.id == 'm2' || target.id == 'm3') {
+      Future.delayed(const Duration(seconds: 2), () {
+        if (!mounted) return;
+        final autoReplyKey = pingKeyOrText == 'q_where'
+            ? 'q_otw'
+            : (pingKeyOrText == 'q_love' ? 'q_love' : 'q_home');
+        _triggerIncomingDynamicBanner(
+          senderId: target.id,
+          senderName: target.name,
+          messageText: AppStrings.t(autoReplyKey),
+        );
+      });
+    } else {
+      Future.delayed(const Duration(seconds: 6), () {
+        if (mounted) {
+          setState(() => _activeMemberBubblePings.remove(target.id));
+        }
+      });
+    }
   }
 
-  void _sendQuickPingToMember(MemberData target, String pingText) {
+  // 상대방에게 전화 걸기 또는 문자 보내기 (번호 미등록 시 1회 미니 입력 모달 자동 연결)
+  Future<void> _handleMemberPhoneAction({
+    required MemberData member,
+    required bool isCall,
+  }) async {
     HapticFeedback.selectionClick();
-    setState(() {
-      _activeMemberBubblePings[target.id] = pingText;
-    });
-    _mapController.move(target.location, 15.3);
+    final savedPhone = AppEngineService.instance.memberPhones[member.id] ?? '';
+    if (savedPhone.isNotEmpty) {
+      if (isCall) {
+        await AppEngineService.launchNativePhoneCall(savedPhone);
+      } else {
+        await AppEngineService.launchNativeSms(
+          phone: savedPhone,
+          bodyText: '[Pingo] ${member.name}, ${AppStrings.t('q_where')}',
+        );
+      }
+      return;
+    }
+
+    final phoneCtrl = TextEditingController();
+    await showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: AppColors.cardWhite,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(26)),
+      ),
+      builder: (ctx) => Padding(
+        padding: EdgeInsets.only(
+          left: 22,
+          right: 22,
+          top: 20,
+          bottom: MediaQuery.of(ctx).viewInsets.bottom + 24,
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Icon(
+                  isCall ? Icons.call_rounded : Icons.sms_rounded,
+                  color: AppColors.primaryPurple,
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    '${member.name} • ${AppStrings.t('phone_input_title')}',
+                    style: const TextStyle(
+                      fontSize: 16,
+                      fontWeight: FontWeight.bold,
+                      color: AppColors.textDark,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: phoneCtrl,
+              keyboardType: TextInputType.phone,
+              autofocus: true,
+              decoration: InputDecoration(
+                hintText: AppStrings.t('phone_input_hint'),
+                filled: true,
+                fillColor: const Color(0xFFF8FAFC),
+                border: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(14),
+                ),
+              ),
+            ),
+            const SizedBox(height: 14),
+            SizedBox(
+              width: double.infinity,
+              height: 48,
+              child: ElevatedButton.icon(
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: AppColors.primaryPurple,
+                  foregroundColor: Colors.white,
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(14),
+                  ),
+                ),
+                onPressed: () async {
+                  final input = phoneCtrl.text.trim();
+                  Navigator.pop(ctx);
+                  if (input.isNotEmpty) {
+                    await AppEngineService.instance.savePhoneForMember(
+                      member.id,
+                      input,
+                    );
+                    if (isCall) {
+                      await AppEngineService.launchNativePhoneCall(input);
+                    } else {
+                      await AppEngineService.launchNativeSms(
+                        phone: input,
+                        bodyText:
+                            '[Pingo] ${member.name}, ${AppStrings.t('q_where')}',
+                      );
+                    }
+                  } else if (!isCall) {
+                    await AppEngineService.launchNativeSms(
+                      bodyText:
+                          '[Pingo] ${member.name}, ${AppStrings.t('q_where')}',
+                    );
+                  }
+                },
+                icon: Icon(isCall ? Icons.call_rounded : Icons.send_rounded),
+                label: Text(
+                  AppStrings.t('phone_save_call'),
+                  style: const TextStyle(fontWeight: FontWeight.bold),
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
   }
 
   void _showLife360SilentSosModal() {
     HapticFeedback.heavyImpact();
-    int secondsLeft = 10;
+    // 이미 SOS가 켜져 있다면 즉시 SOS 해제!
+    if (isMySosActive) {
+      setState(() {
+        isMySosActive = false;
+        _activeMemberBubblePings.remove('m1');
+      });
+      AppEngineService.instance.pushLiveLocationToServer(
+        circleCode: activeCircle.code,
+        userName: _allMembers[0].name,
+        point: _allMembers[0].location,
+        battery: _allMembers[0].battery,
+        avatarUrl: _allMembers[0].avatarUrl,
+        isSos: false,
+      );
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          backgroundColor: AppColors.safeGreenText,
+          content: Text(AppStrings.t('sos_cleared_toast')),
+        ),
+      );
+      return;
+    }
+
+    int secondsLeft = 5;
     Timer? sosTimer;
     final TextEditingController pinCtrl = TextEditingController();
 
@@ -564,12 +866,20 @@ class _MainLife360MapScreenState extends State<MainLife360MapScreen>
                 t.cancel();
                 if (Navigator.canPop(ctx)) Navigator.pop(ctx);
 
+                setState(() {
+                  isMySosActive = true;
+                  AppEngineService.instance.isBubblePrivacyActive = false;
+                  _activeMemberBubblePings['m1'] = '🚨 SOS';
+                });
+
                 await AppEngineService.instance.pushLiveLocationToServer(
                   circleCode: activeCircle.code,
                   userName: _allMembers[0].name,
                   point: _allMembers[0].location,
                   battery: _allMembers[0].battery,
                   avatarUrl: _allMembers[0].avatarUrl,
+                  audioClipDataUrl:
+                      'PING::🚨 SOS!::${DateTime.now().millisecondsSinceEpoch}::${AppEngineService.instance.myPhoneNumber}',
                   isSos: true,
                 );
 
@@ -652,6 +962,7 @@ class _MainLife360MapScreenState extends State<MainLife360MapScreen>
                   const SizedBox(height: 16),
                   TextField(
                     controller: pinCtrl,
+                onChanged: (v) { if (v.trim().length >= 4) { Navigator.pop(ctx); } },
                     keyboardType: TextInputType.number,
                     maxLength: 4,
                     textAlign: TextAlign.center,
@@ -711,15 +1022,30 @@ class _MainLife360MapScreenState extends State<MainLife360MapScreen>
     ).whenComplete(() => sosTimer?.cancel());
   }
 
-  void _sendOneTapCheckIn() {
+  Future<void> _sendOneTapCheckIn() async {
     HapticFeedback.mediumImpact();
+    // 체크인 시 버블 모드가 켜져 있다면 즉시 해제하고 실제 도로명 주소와 함께 서클 전체에 발송!
+    final cleanAddr = _allMembers[0].statusText.split('•').first.trim();
+    final checkInMsg = '📍 ${AppStrings.t('checkin_bubble')} ($cleanAddr)';
     setState(() {
-      _activeMemberBubblePings['m1'] = AppStrings.t('checkin_bubble');
+      AppEngineService.instance.isBubblePrivacyActive = false;
+      _activeMemberBubblePings['m1'] = checkInMsg;
     });
+    await AppEngineService.instance.pushLiveLocationToServer(
+      circleCode: activeCircle.code,
+      userName: _allMembers[0].name,
+      point: _allMembers[0].location,
+      battery: _allMembers[0].battery,
+      avatarUrl: _allMembers[0].avatarUrl,
+      audioClipDataUrl:
+          'CHECKIN::$checkInMsg::${DateTime.now().millisecondsSinceEpoch}::${AppEngineService.instance.myPhoneNumber}',
+      speedKmh: _allMembers[0].speedKmh,
+    );
+    if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
         backgroundColor: AppColors.primaryPurple,
-        content: Text('👋 ${AppStrings.t('checkin_toast')}'),
+        content: Text('📍 ${AppStrings.t('checkin_toast')} ($cleanAddr)'),
         duration: const Duration(seconds: 2),
       ),
     );
@@ -737,7 +1063,12 @@ class _MainLife360MapScreenState extends State<MainLife360MapScreen>
   void _showMultiCircleSwitcherSheet() {
     final code = activeCircle.code.padRight(6, '0');
     final formattedCode = '${code.substring(0, 3)}-${code.substring(3, 6)}';
+    final inviteFullText = AppStrings.t('invite_auto_msg')
+        .replaceAll('{CODE}', activeCircle.code);
     final nameEditCtrl = TextEditingController(text: _allMembers[0].name);
+    final phoneEditCtrl = TextEditingController(
+      text: AppEngineService.instance.myPhoneNumber,
+    );
 
     showModalBottomSheet(
       context: context,
@@ -913,24 +1244,50 @@ class _MainLife360MapScreenState extends State<MainLife360MapScreen>
                           ),
                           const SizedBox(width: 12),
                           Expanded(
-                            child: TextField(
-                              controller: nameEditCtrl,
-                              style: const TextStyle(
-                                fontWeight: FontWeight.bold,
-                                fontSize: 14,
-                              ),
-                              decoration: InputDecoration(
-                                isDense: true,
-                                contentPadding: const EdgeInsets.symmetric(
-                                  horizontal: 12,
-                                  vertical: 10,
+                            child: Column(
+                              children: [
+                                TextField(
+                                  controller: nameEditCtrl,
+                                  style: const TextStyle(
+                                    fontWeight: FontWeight.bold,
+                                    fontSize: 13.5,
+                                  ),
+                                  decoration: InputDecoration(
+                                    isDense: true,
+                                    contentPadding: const EdgeInsets.symmetric(
+                                      horizontal: 12,
+                                      vertical: 9,
+                                    ),
+                                    filled: true,
+                                    fillColor: Colors.white,
+                                    border: OutlineInputBorder(
+                                      borderRadius: BorderRadius.circular(12),
+                                    ),
+                                  ),
                                 ),
-                                filled: true,
-                                fillColor: Colors.white,
-                                border: OutlineInputBorder(
-                                  borderRadius: BorderRadius.circular(12),
+                                const SizedBox(height: 6),
+                                TextField(
+                                  controller: phoneEditCtrl,
+                                  keyboardType: TextInputType.phone,
+                                  style: const TextStyle(
+                                    fontWeight: FontWeight.w600,
+                                    fontSize: 12.5,
+                                  ),
+                                  decoration: InputDecoration(
+                                    isDense: true,
+                                    hintText: AppStrings.t('my_phone_hint'),
+                                    contentPadding: const EdgeInsets.symmetric(
+                                      horizontal: 12,
+                                      vertical: 8,
+                                    ),
+                                    filled: true,
+                                    fillColor: Colors.white,
+                                    border: OutlineInputBorder(
+                                      borderRadius: BorderRadius.circular(12),
+                                    ),
+                                  ),
                                 ),
-                              ),
+                              ],
                             ),
                           ),
                           const SizedBox(width: 8),
@@ -940,7 +1297,7 @@ class _MainLife360MapScreenState extends State<MainLife360MapScreen>
                               foregroundColor: Colors.white,
                               padding: const EdgeInsets.symmetric(
                                 horizontal: 12,
-                                vertical: 10,
+                                vertical: 14,
                               ),
                               shape: RoundedRectangleBorder(
                                 borderRadius: BorderRadius.circular(12),
@@ -948,6 +1305,8 @@ class _MainLife360MapScreenState extends State<MainLife360MapScreen>
                             ),
                             onPressed: () {
                               final newName = nameEditCtrl.text.trim();
+                              final newPhone = phoneEditCtrl.text.trim();
+                              AppEngineService.instance.myPhoneNumber = newPhone;
                               if (newName.isNotEmpty) {
                                 setState(() {
                                   _allMembers[0].name = newName;
@@ -955,6 +1314,14 @@ class _MainLife360MapScreenState extends State<MainLife360MapScreen>
                                       ? newName.substring(newName.length - 2)
                                       : newName;
                                 });
+                                AppEngineService.instance
+                                    .pushLiveLocationToServer(
+                                      circleCode: activeCircle.code,
+                                      userName: newName,
+                                      point: _allMembers[0].location,
+                                      battery: _allMembers[0].battery,
+                                      avatarUrl: _allMembers[0].avatarUrl,
+                                    );
                                 Navigator.pop(ctx);
                                 ScaffoldMessenger.of(this.context).showSnackBar(
                                   SnackBar(
@@ -1021,66 +1388,114 @@ class _MainLife360MapScreenState extends State<MainLife360MapScreen>
                   );
                 }),
                 const Divider(color: AppColors.divider, height: 20),
+                // Life360 스타일 초대 코드 + [💬 메신저 공유] / [✉️ 문자 전송] / [📋 복사] 3종 자동 입력 세트
                 Container(
                   padding: const EdgeInsets.all(14),
                   decoration: BoxDecoration(
                     color: AppColors.lightPurpleBg,
                     borderRadius: BorderRadius.circular(18),
                   ),
-                  child: Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      Expanded(
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Text(
-                              '${activeCircle.name} • ${AppStrings.t('invite_code_label')}',
-                              overflow: TextOverflow.ellipsis,
-                              style: const TextStyle(
-                                fontSize: 12,
-                                color: AppColors.textGray,
-                              ),
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                        children: [
+                          Text(
+                            '${activeCircle.name} • ${AppStrings.t('invite_code_label')}',
+                            style: const TextStyle(
+                              fontSize: 12,
+                              fontWeight: FontWeight.bold,
+                              color: AppColors.textGray,
                             ),
-                            const SizedBox(height: 4),
-                            Text(
-                              formattedCode,
-                              style: const TextStyle(
-                                fontSize: 19,
-                                fontWeight: FontWeight.w900,
-                                letterSpacing: 2,
-                                color: AppColors.primaryPurple,
-                              ),
-                            ),
-                          ],
-                        ),
-                      ),
-                      ElevatedButton.icon(
-                        style: ElevatedButton.styleFrom(
-                          backgroundColor: AppColors.primaryPurple,
-                          foregroundColor: Colors.white,
-                          elevation: 0,
-                          shape: RoundedRectangleBorder(
-                            borderRadius: BorderRadius.circular(20),
                           ),
-                        ),
-                        onPressed: () {
-                          Clipboard.setData(
-                            ClipboardData(
-                              text:
-                                  '[Pingo] ‘${activeCircle.name}’ Code: $formattedCode',
+                          Text(
+                            formattedCode,
+                            style: const TextStyle(
+                              fontSize: 19,
+                              fontWeight: FontWeight.w900,
+                              letterSpacing: 2,
+                              color: AppColors.primaryPurple,
                             ),
-                          );
-                          Navigator.pop(ctx);
-                          ScaffoldMessenger.of(this.context).showSnackBar(
-                            SnackBar(
-                              backgroundColor: AppColors.primaryPurple,
-                              content: Text(AppStrings.t('code_copied')),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 10),
+                      Row(
+                        children: [
+                          Expanded(
+                            child: ElevatedButton(
+                              style: ElevatedButton.styleFrom(
+                                backgroundColor: AppColors.primaryPurple,
+                                foregroundColor: Colors.white,
+                                elevation: 0,
+                                padding: const EdgeInsets.symmetric(vertical: 10),
+                                shape: RoundedRectangleBorder(
+                                  borderRadius: BorderRadius.circular(14),
+                                ),
+                              ),
+                              onPressed: () {
+                                SharePlus.instance.share(ShareParams(text: inviteFullText));
+                              },
+                              child: Text(
+                                AppStrings.t('share_messenger_btn'),
+                                style: const TextStyle(
+                                  fontSize: 11.5,
+                                  fontWeight: FontWeight.bold,
+                                ),
+                              ),
                             ),
-                          );
-                        },
-                        icon: const Icon(Icons.copy_rounded, size: 15),
-                        label: Text(AppStrings.t('invite_member_btn')),
+                          ),
+                          const SizedBox(width: 6),
+                          Expanded(
+                            child: ElevatedButton(
+                              style: ElevatedButton.styleFrom(
+                                backgroundColor: const Color(0xFF10B981),
+                                foregroundColor: Colors.white,
+                                elevation: 0,
+                                padding: const EdgeInsets.symmetric(vertical: 10),
+                                shape: RoundedRectangleBorder(
+                                  borderRadius: BorderRadius.circular(14),
+                                ),
+                              ),
+                              onPressed: () {
+                                AppEngineService.launchNativeSms(
+                                  bodyText: inviteFullText,
+                                );
+                              },
+                              child: Text(
+                                AppStrings.t('share_sms_btn'),
+                                style: const TextStyle(
+                                  fontSize: 11.5,
+                                  fontWeight: FontWeight.bold,
+                                ),
+                              ),
+                            ),
+                          ),
+                          const SizedBox(width: 6),
+                          IconButton(
+                            style: IconButton.styleFrom(
+                              backgroundColor: Colors.white,
+                            ),
+                            onPressed: () {
+                              Clipboard.setData(
+                                ClipboardData(text: inviteFullText),
+                              );
+                              Navigator.pop(ctx);
+                              ScaffoldMessenger.of(this.context).showSnackBar(
+                                SnackBar(
+                                  backgroundColor: AppColors.primaryPurple,
+                                  content: Text(AppStrings.t('code_copied')),
+                                ),
+                              );
+                            },
+                            icon: const Icon(
+                              Icons.copy_rounded,
+                              size: 18,
+                              color: AppColors.primaryPurple,
+                            ),
+                          ),
+                        ],
                       ),
                     ],
                   ),
@@ -1123,7 +1538,6 @@ class _MainLife360MapScreenState extends State<MainLife360MapScreen>
       ),
     );
   }
-
   Future<void> _syncMyRealGpsLocationWithDisclosure() async {
     if (!_hasShownLocationDisclosure) {
       final agreed = await showModalBottomSheet<bool>(
@@ -1226,20 +1640,30 @@ class _MainLife360MapScreenState extends State<MainLife360MapScreen>
       final realAddr = await AppEngineService.instance.fetchRoadAddress(
         realLatLng,
       );
-      final snappedRoute = await AppEngineService.instance
-          .fetchRoadSnappedRoute(
-            LatLng(pos.latitude - 0.004, pos.longitude - 0.003),
-            realLatLng,
-          );
 
       if (!mounted) return;
       setState(() {
         _allMembers[0].location = realLatLng;
         _allMembers[0].speedKmh = speedKmh;
         _allMembers[0].statusText = '$realAddr • ${AppStrings.t('just_now')}';
-        _allMembers[0].recentRoute = snappedRoute;
+        if (_allMembers[0].recentRoute.length <= 1) {
+          _allMembers[0].recentRoute = [realLatLng];
+        } else {
+          final lastPt = _allMembers[0].recentRoute.last;
+          if (AppEngineService.instance.calculateDistanceMeters(
+                lastPt,
+                realLatLng,
+              ) >=
+              15.0) {
+            _allMembers[0].recentRoute = [
+              ..._allMembers[0].recentRoute,
+              realLatLng,
+            ];
+          }
+        }
 
-        if (_allMembers.length >= 3) {
+        if (_allMembers.length >= 3 &&
+            (_showDemoMembers || activeCircle.code == '999999')) {
           _allMembers[1].location = LatLng(
             realLatLng.latitude + 0.0042,
             realLatLng.longitude - 0.0018,
@@ -1249,18 +1673,7 @@ class _MainLife360MapScreenState extends State<MainLife360MapScreen>
             realLatLng.longitude + 0.0048,
           );
         }
-
-        if (safePlaces.isNotEmpty) {
-          safePlaces[0] = SafePlaceData(
-            id: safePlaces[0].id,
-            name: safePlaces[0].name,
-            iconData: safePlaces[0].iconData,
-            point: realLatLng,
-            radiusMeters: safePlaces[0].radiusMeters,
-          );
-        }
       });
-
       _mapController.move(realLatLng, 15.3);
 
       await AppEngineService.instance.pushLiveLocationToServer(
@@ -1836,7 +2249,7 @@ class _MainLife360MapScreenState extends State<MainLife360MapScreen>
                         : AppEngineService.proMonthlyProductId;
                     await AppEngineService.instance.purchaseProSubscription(
                       productId: targetProdId,
-                      onActivated: () {
+                      onProUnlocked: () {
                         if (mounted) {
                           setState(() => isProUser = true);
                           Navigator.pop(ctx);
@@ -1900,7 +2313,7 @@ class _MainLife360MapScreenState extends State<MainLife360MapScreen>
                   TextButton(
                     onPressed: () async {
                       await AppEngineService.instance.restoreProPurchases(
-                        onRestored: () {
+                        onProUnlocked: () {
                           if (!mounted) return;
                           setState(() => isProUser = true);
                           Navigator.pop(ctx);
@@ -1995,17 +2408,38 @@ class _MainLife360MapScreenState extends State<MainLife360MapScreen>
                       borderStrokeWidth: 2.2,
                     ),
                   ),
-                  if (isPickingPlaceOnMap)
-                    CircleMarker(
-                      point: draftPlacePoint,
-                      radius: draftPlaceRadius,
-                      useRadiusInMeter: true,
-                      color: const Color(0x386C47FF),
-                      borderColor: AppColors.primaryPurple,
-                      borderStrokeWidth: 2.5,
-                    ),
-                ],
-              ),
+                      if (AppEngineService.instance.isBubblePrivacyActive)
+                        CircleMarker(
+                          point: _allMembers[0].location,
+                          radius: 600.0,
+                          useRadiusInMeter: true,
+                          color: const Color(0x308B5CF6),
+                          borderColor: const Color(0xFF7C3AED),
+                          borderStrokeWidth: 2.5,
+                        ),
+                      ...activeMembers
+                          .where((m) => _otherBubbleMemberIds.contains(m.id))
+                          .map(
+                            (m) => CircleMarker(
+                              point: m.location,
+                              radius: 600.0,
+                              useRadiusInMeter: true,
+                              color: const Color(0x30EC4899),
+                              borderColor: const Color(0xFFDB2777),
+                              borderStrokeWidth: 2.5,
+                            ),
+                          ),
+                      if (isPickingPlaceOnMap)
+                        CircleMarker(
+                          point: draftPlacePoint,
+                          radius: draftPlaceRadius,
+                          useRadiusInMeter: true,
+                          color: const Color(0x386C47FF),
+                          borderColor: AppColors.primaryPurple,
+                          borderStrokeWidth: 2.5,
+                        ),
+                    ],
+                  ),
               if (selectedMember != null &&
                   selectedMember.recentRoute.length > 1)
                 PolylineLayer(
@@ -2093,8 +2527,8 @@ class _MainLife360MapScreenState extends State<MainLife360MapScreen>
                     height: 142,
                     child: GestureDetector(
                       onTap: () => _focusMemberOnMap(m),
-                      onLongPressStart: (_) => _startPttRecording(m.name, m.id),
-                      onLongPressEnd: (_) => _stopAndSendPttRecording(m.id),
+                      
+                      
                       child: Stack(
                         alignment: Alignment.center,
                         children: [
@@ -2469,96 +2903,126 @@ class _MainLife360MapScreenState extends State<MainLife360MapScreen>
             ),
           ),
 
-          if (isPttRecording)
-            Center(
-              child: Container(
-                width: 260,
-                padding: const EdgeInsets.symmetric(
-                  horizontal: 22,
-                  vertical: 20,
-                ),
-                decoration: BoxDecoration(
-                  color: AppColors.textDark.withValues(alpha: 0.94),
-                  borderRadius: BorderRadius.circular(26),
-                  boxShadow: const [
-                    BoxShadow(color: Colors.black38, blurRadius: 24),
-                  ],
-                ),
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Row(
-                      mainAxisAlignment: MainAxisAlignment.center,
+            if (_incomingBannerSenderId != null && _incomingBannerText != null)
+              Positioned(
+                top: 66,
+                left: 16,
+                right: 16,
+                child: Material(
+                  color: Colors.transparent,
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 14,
+                      vertical: 12,
+                    ),
+                    decoration: BoxDecoration(
+                      gradient: const LinearGradient(
+                        colors: [Color(0xFF1E1B4B), Color(0xFF312E81)],
+                      ),
+                      borderRadius: BorderRadius.circular(22),
+                      boxShadow: const [
+                        BoxShadow(
+                          color: Colors.black38,
+                          blurRadius: 18,
+                          offset: Offset(0, 6),
+                        ),
+                      ],
+                    ),
+                    child: Row(
                       children: [
                         const Icon(
-                          Icons.mic_rounded,
-                          color: Color(0xFFFF4D4F),
+                          Icons.auto_awesome_rounded,
+                          color: Color(0xFFF472B6),
                           size: 20,
                         ),
+                        const SizedBox(width: 10),
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Text(
+                                _incomingBannerSenderName ?? '',
+                                style: const TextStyle(
+                                  color: Colors.white70,
+                                  fontSize: 11,
+                                  fontWeight: FontWeight.bold,
+                                ),
+                              ),
+                              Text(
+                                _incomingBannerText!,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: const TextStyle(
+                                  color: Colors.white,
+                                  fontSize: 14,
+                                  fontWeight: FontWeight.w900,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
                         const SizedBox(width: 6),
-                        Text(
-                          '${pttRemainingSec.toStringAsFixed(1)}s • ${AppStrings.t('ptt_live_mic')}',
-                          style: const TextStyle(
-                            color: Color(0xFFFF4D4F),
-                            fontWeight: FontWeight.w900,
-                            fontSize: 14,
+                        GestureDetector(
+                          onTap: () {
+                            final sender = _allMembers.firstWhere(
+                              (m) => m.id == _incomingBannerSenderId,
+                              orElse: () => _allMembers.last,
+                            );
+                            setState(() => _incomingBannerSenderId = null);
+                            _sendQuickPingToMember(sender, 'q_otw');
+                          },
+                          child: Container(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 10,
+                              vertical: 7,
+                            ),
+                            decoration: BoxDecoration(
+                              gradient: const LinearGradient(
+                                colors: [Color(0xFF10B981), Color(0xFF059669)],
+                              ),
+                              borderRadius: BorderRadius.circular(14),
+                            ),
+                            child: Text(
+                              AppStrings.t('reply_otw'),
+                              style: const TextStyle(
+                                color: Colors.white,
+                                fontSize: 11,
+                                fontWeight: FontWeight.bold,
+                              ),
+                            ),
+                          ),
+                        ),
+                        const SizedBox(width: 6),
+                        GestureDetector(
+                          onTap: () {
+                            final sender = _allMembers.firstWhere(
+                              (m) => m.id == _incomingBannerSenderId,
+                              orElse: () => _allMembers.last,
+                            );
+                            _handleMemberPhoneAction(
+                              member: sender,
+                              isCall: true,
+                            );
+                          },
+                          child: Container(
+                            padding: const EdgeInsets.all(7),
+                            decoration: const BoxDecoration(
+                              color: Colors.white24,
+                              shape: BoxShape.circle,
+                            ),
+                            child: const Icon(
+                              Icons.call_rounded,
+                              color: Colors.white,
+                              size: 16,
+                            ),
                           ),
                         ),
                       ],
                     ),
-                    const SizedBox(height: 12),
-                    AnimatedBuilder(
-                      animation: _pulseController,
-                      builder: (context, _) {
-                        return SizedBox(
-                          height: 32,
-                          child: Row(
-                            mainAxisAlignment: MainAxisAlignment.center,
-                            children: List.generate(12, (idx) {
-                              final wave = math.sin(
-                                (_pulseController.value * 2 * math.pi) +
-                                    (idx * 0.7),
-                              );
-                              final barHeight = 8.0 + (wave.abs() * 22.0);
-                              return Container(
-                                width: 5,
-                                height: barHeight,
-                                margin: const EdgeInsets.symmetric(
-                                  horizontal: 3,
-                                ),
-                                decoration: BoxDecoration(
-                                  color: AppColors.primaryPurple,
-                                  borderRadius: BorderRadius.circular(4),
-                                ),
-                              );
-                            }),
-                          ),
-                        );
-                      },
-                    ),
-                    const SizedBox(height: 12),
-                    Text(
-                      '${AppStrings.t('ptt_sending_to')} $pttTargetName',
-                      textAlign: TextAlign.center,
-                      style: const TextStyle(
-                        color: Colors.white,
-                        fontWeight: FontWeight.bold,
-                        fontSize: 14,
-                      ),
-                    ),
-                    const SizedBox(height: 4),
-                    Text(
-                      AppStrings.t('ptt_release_hint'),
-                      textAlign: TextAlign.center,
-                      style: const TextStyle(
-                        color: Colors.white60,
-                        fontSize: 11,
-                      ),
-                    ),
-                  ],
+                  ),
                 ),
               ),
-            ),
 
           DraggableScrollableSheet(
             controller: _sheetController,
@@ -2728,7 +3192,7 @@ class _MainLife360MapScreenState extends State<MainLife360MapScreen>
   }
 
   Widget _buildDefaultMemberListSheet() {
-    final activeMembers = visibleMembers;
+    final otherMembers = visibleMembers.where((m) => m.id != 'm1').toList();
 
     return Column(
       mainAxisSize: MainAxisSize.min,
@@ -2792,36 +3256,41 @@ class _MainLife360MapScreenState extends State<MainLife360MapScreen>
             const SizedBox(width: 8),
             Expanded(
               child: GestureDetector(
-                onTapDown: (_) => _startPttRecording(activeCircle.name, 'm1'),
-                onTapUp: (_) => _stopAndSendPttRecording('m1'),
-                onTapCancel: () => _stopAndSendPttRecording('m1'),
+                onTap: () {
+                  HapticFeedback.selectionClick();
+                  setState(() => selectedMemberId = 'm1');
+                  _mapController.move(_allMembers[0].location, 15.5);
+                },
                 child: Container(
                   padding: const EdgeInsets.symmetric(
                     vertical: 12,
                     horizontal: 8,
                   ),
                   decoration: BoxDecoration(
-                    color: AppColors.primaryPurple,
+                    color: AppColors.lightPurpleBg,
                     borderRadius: BorderRadius.circular(16),
+                    border: Border.all(
+                      color: AppColors.primaryPurple.withValues(alpha: 0.25),
+                    ),
                   ),
                   child: Row(
                     mainAxisAlignment: MainAxisAlignment.center,
                     children: [
-                      const Icon(
-                        Icons.mic_rounded,
+                      Icon(
+                        Icons.timeline_rounded,
                         size: 17,
-                        color: Colors.white,
+                        color: AppColors.primaryPurple,
                       ),
-                      const SizedBox(width: 5),
+                      SizedBox(width: 5),
                       Flexible(
                         child: Text(
-                          AppStrings.t('ptt_hold_btn'),
+                          AppStrings.t('my_timeline_btn'),
                           maxLines: 1,
                           overflow: TextOverflow.ellipsis,
-                          style: const TextStyle(
+                          style: TextStyle(
                             fontSize: 12.5,
                             fontWeight: FontWeight.w800,
-                            color: Colors.white,
+                            color: AppColors.primaryPurple,
                           ),
                         ),
                       ),
@@ -2830,23 +3299,6 @@ class _MainLife360MapScreenState extends State<MainLife360MapScreen>
                 ),
               ),
             ),
-            if (AppEngineService.instance.lastRecordedAudioSource != null) ...[
-              const SizedBox(width: 6),
-              IconButton.filledTonal(
-                tooltip: AppStrings.t('ptt_replay_btn'),
-                style: IconButton.styleFrom(
-                  backgroundColor: AppColors.lightPurpleBg,
-                  foregroundColor: AppColors.primaryPurple,
-                ),
-                onPressed: () {
-                  final src = AppEngineService.instance.lastRecordedAudioSource;
-                  if (src != null) {
-                    AppEngineService.instance.playVoiceSource(src);
-                  }
-                },
-                icon: const Icon(Icons.volume_up_rounded, size: 18),
-              ),
-            ],
           ],
         ),
         const SizedBox(height: 12),
@@ -2862,7 +3314,7 @@ class _MainLife360MapScreenState extends State<MainLife360MapScreen>
                     const SizedBox(width: 6),
                     Flexible(
                       child: Text(
-                        '• ${AppStrings.t('members_count')} (${activeMembers.length})',
+                        '• ${AppStrings.t('members_count')} (${otherMembers.length})',
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
                         style: const TextStyle(
@@ -2933,31 +3385,60 @@ class _MainLife360MapScreenState extends State<MainLife360MapScreen>
         ),
         const SizedBox(height: 6),
         const Divider(color: AppColors.divider, height: 10),
-        ...activeMembers.map(
-          (m) => InkWell(
-            onTap: () => _focusMemberOnMap(m),
-            child: Padding(
-              padding: const EdgeInsets.symmetric(vertical: 10.0),
-              child: Row(
-                children: [
-                  GestureDetector(
-                    onTap: () => AppEngineService.showAvatarAndPhotoPickerModal(
-                      context: context,
-                      currentAvatarUrl: m.avatarUrl,
-                      onSelected: (newUrl) {
-                        setState(() => m.avatarUrl = newUrl);
-                        if (m.id == 'm1') {
-                          AppEngineService.instance.pushLiveLocationToServer(
-                            circleCode: activeCircle.code,
-                            userName: m.name,
-                            point: m.location,
-                            battery: m.battery,
-                            avatarUrl: newUrl,
-                          );
-                        }
-                      },
+        if (otherMembers.isEmpty)
+          Padding(
+            padding: const EdgeInsets.symmetric(vertical: 12.0),
+            child: InkWell(
+              onTap: _showMultiCircleSwitcherSheet,
+              borderRadius: BorderRadius.circular(14),
+              child: Container(
+                width: double.infinity,
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 14,
+                  vertical: 12,
+                ),
+                decoration: BoxDecoration(
+                  color: const Color(0xFFF8FAFC),
+                  borderRadius: BorderRadius.circular(14),
+                  border: Border.all(color: const Color(0xFFE2E8F0)),
+                ),
+                child: Row(
+                  children: [
+                    const Icon(
+                      Icons.person_add_alt_1_rounded,
+                      size: 18,
+                      color: AppColors.primaryPurple,
                     ),
-                    child: Stack(
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: Text(
+                        '(' + activeCircle.code + ') ' + AppStrings.t('share_circle_banner'),
+                        style: const TextStyle(
+                          fontSize: 12,
+                          fontWeight: FontWeight.w600,
+                          color: AppColors.textDark,
+                        ),
+                      ),
+                    ),
+                    const Icon(
+                      Icons.arrow_forward_ios_rounded,
+                      size: 13,
+                      color: AppColors.textGray,
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          )
+        else
+          ...otherMembers.map(
+            (m) => InkWell(
+              onTap: () => _focusMemberOnMap(m),
+              child: Padding(
+                padding: const EdgeInsets.symmetric(vertical: 10.0),
+                child: Row(
+                  children: [
+                    Stack(
                       clipBehavior: Clip.none,
                       children: [
                         Container(
@@ -2989,9 +3470,7 @@ class _MainLife360MapScreenState extends State<MainLife360MapScreen>
                               ),
                             ),
                             child: Icon(
-                              m.id == 'm1'
-                                  ? Icons.camera_alt_rounded
-                                  : m.statusIcon,
+                              m.statusIcon,
                               size: 11,
                               color: AppColors.primaryPurple,
                             ),
@@ -2999,97 +3478,330 @@ class _MainLife360MapScreenState extends State<MainLife360MapScreen>
                         ),
                       ],
                     ),
-                  ),
-                  const SizedBox(width: 12),
-                  Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Row(
-                          children: [
-                            Flexible(
-                              child: Text(
-                                m.name,
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
-                                style: const TextStyle(
-                                  fontSize: 15,
-                                  fontWeight: FontWeight.bold,
-                                  color: AppColors.textDark,
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Row(
+                            children: [
+                              Flexible(
+                                child: Text(
+                                  m.name,
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: const TextStyle(
+                                    fontSize: 15,
+                                    fontWeight: FontWeight.bold,
+                                    color: AppColors.textDark,
+                                  ),
                                 ),
                               ),
-                            ),
-                            if (m.id == 'm1') ...[
-                              const SizedBox(width: 5),
-                              GestureDetector(
-                                onTap: _showMultiCircleSwitcherSheet,
-                                child: const Icon(
-                                  Icons.edit_rounded,
-                                  size: 14,
-                                  color: AppColors.primaryPurple,
-                                ),
-                              ),
+                              const SizedBox(width: 6),
+                              _buildSmartMotionBadge(m),
                             ],
-                            const SizedBox(width: 6),
-                            _buildSmartMotionBadge(m),
-                          ],
-                        ),
-                        const SizedBox(height: 3),
-                        Text(
-                          m.statusText,
-                          style: const TextStyle(
-                            fontSize: 12,
-                            color: AppColors.textGray,
                           ),
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                        ),
-                      ],
-                    ),
-                  ),
-                  const SizedBox(width: 6),
-                  Container(
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 9,
-                      vertical: 4,
-                    ),
-                    decoration: BoxDecoration(
-                      color: AppColors.safeGreenBg,
-                      borderRadius: BorderRadius.circular(20),
-                    ),
-                    child: Text(
-                      '${m.battery}%',
-                      style: const TextStyle(
-                        fontSize: 11.5,
-                        fontWeight: FontWeight.bold,
-                        color: AppColors.safeGreenText,
+                          const SizedBox(height: 3),
+                          Text(
+                            m.statusText,
+                            style: const TextStyle(
+                              fontSize: 12,
+                              color: AppColors.textGray,
+                            ),
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        ],
                       ),
                     ),
-                  ),
-                ],
+                    const SizedBox(width: 6),
+                    Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 9,
+                        vertical: 4,
+                      ),
+                      decoration: BoxDecoration(
+                        color: AppColors.safeGreenBg,
+                        borderRadius: BorderRadius.circular(20),
+                      ),
+                      child: Text(
+                        '${m.battery}%',
+                        style: const TextStyle(
+                          fontSize: 11.5,
+                          fontWeight: FontWeight.bold,
+                          color: AppColors.safeGreenText,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
               ),
             ),
           ),
-        ),
       ],
     );
   }
 
   Widget _buildMemberHistoryDrillDownSheet(MemberData member) {
     final bool isMe = member.id == 'm1';
-    final quickPingList = [
-      AppStrings.t('ping_1'),
-      AppStrings.t('ping_2'),
-      AppStrings.t('ping_3'),
+
+    // Life360을 뛰어넘는 듀얼 파스텔 그라데이션 이모지 퀵 노트 8종 세트
+    final emojiQuickNotes = [
+      {
+        'key': 'q_where',
+        'bg': [const Color(0xFFEDE9FE), const Color(0xFFDDD6FE)],
+        'border': const Color(0xFF8B5CF6),
+        'text': const Color(0xFF5B21B6),
+      },
+      {
+        'key': 'q_otw',
+        'bg': [const Color(0xFFD1FAE5), const Color(0xFFA7F3D0)],
+        'border': const Color(0xFF10B981),
+        'text': const Color(0xFF065F46),
+      },
+      {
+        'key': 'q_home',
+        'bg': [const Color(0xFFDBEAFE), const Color(0xFFBFDBFE)],
+        'border': const Color(0xFF3B82F6),
+        'text': const Color(0xFF1E40AF),
+      },
+      {
+        'key': 'q_call',
+        'bg': [const Color(0xFFFEF3C7), const Color(0xFFFDE68A)],
+        'border': const Color(0xFFF59E0B),
+        'text': const Color(0xFF92400E),
+      },
+      {
+        'key': 'q_meal',
+        'bg': [const Color(0xFFFFEDD5), const Color(0xFFFED7AA)],
+        'border': const Color(0xFFF97316),
+        'text': const Color(0xFF9A3412),
+      },
+      {
+        'key': 'q_coffee',
+        'bg': [const Color(0xFFF3E8FF), const Color(0xFFE9D5FF)],
+        'border': const Color(0xFFA855F7),
+        'text': const Color(0xFF6B21A8),
+      },
+      {
+        'key': 'q_lowbat',
+        'bg': [const Color(0xFFFEE2E2), const Color(0xFFFECACA)],
+        'border': const Color(0xFFEF4444),
+        'text': const Color(0xFF991B1B),
+      },
+      {
+        'key': 'q_love',
+        'bg': [const Color(0xFFFCE7F3), const Color(0xFFFBCFE8)],
+        'border': const Color(0xFFEC4899),
+        'text': const Color(0xFF9D174D),
+      },
     ];
 
-    String displayHistorySub = member.statusText;
-    if (_selectedHistoryDayTab == 1) {
-      displayHistorySub = AppStrings.t('history_yesterday_sub');
-    } else if (_selectedHistoryDayTab == 2) {
-      displayHistorySub = AppStrings.t('history_30days_sub');
+    final now = DateTime.now();
+    final tNow =
+        '${now.hour.toString().padLeft(2, '0')}:${now.minute.toString().padLeft(2, '0')}';
+    final tPrev1 =
+        '${now.subtract(const Duration(minutes: 45)).hour.toString().padLeft(2, '0')}:${now.subtract(const Duration(minutes: 45)).minute.toString().padLeft(2, '0')}';
+    final tPrev2 =
+        '${now.subtract(const Duration(hours: 2)).hour.toString().padLeft(2, '0')}:${now.subtract(const Duration(hours: 2)).minute.toString().padLeft(2, '0')}';
+
+    double totalDistKm = 0.0;
+    for (int i = 1; i < member.recentRoute.length; i++) {
+      totalDistKm +=
+          AppEngineService.instance.calculateDistanceMeters(
+            member.recentRoute[i - 1],
+            member.recentRoute[i],
+          ) /
+          1000.0;
     }
 
+    final cleanAddr = member.statusText.split('•').first.trim();
+
+    // [옵션 B] 본인('나')을 클릭했을 때: 타임라인(오늘/어제/30일) + 버블 프라이버시 모드 스위치
+    if (isMe) {
+      final bubbleOn = AppEngineService.instance.isBubblePrivacyActive;
+      return Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              IconButton(
+                visualDensity: VisualDensity.compact,
+                icon: const Icon(Icons.arrow_back_ios_new_rounded, size: 17),
+                onPressed: () => setState(() => selectedMemberId = null),
+              ),
+              const Icon(
+                Icons.timeline_rounded,
+                size: 18,
+                color: AppColors.primaryPurple,
+              ),
+              const SizedBox(width: 6),
+              Expanded(
+                child: Text(
+                  AppStrings.t('my_timeline_btn'),
+                  style: const TextStyle(
+                    fontSize: 15,
+                    fontWeight: FontWeight.bold,
+                    color: AppColors.textDark,
+                  ),
+                ),
+              ),
+              _buildSmartMotionBadge(member),
+            ],
+          ),
+          const SizedBox(height: 8),
+          // 🫧 Life360 버블 프라이버시 모드 스위치 카드
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+            decoration: BoxDecoration(
+              gradient: LinearGradient(
+                colors: bubbleOn
+                    ? [const Color(0xFFEDE9FE), const Color(0xFFFCE7F3)]
+                    : [const Color(0xFFF8FAFC), const Color(0xFFF1F5F9)],
+              ),
+              borderRadius: BorderRadius.circular(14),
+              border: Border.all(
+                color: bubbleOn
+                    ? const Color(0xFF8B5CF6)
+                    : const Color(0xFFE2E8F0),
+              ),
+            ),
+            child: Row(
+              children: [
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        AppStrings.t('bubble_mode_title'),
+                        style: const TextStyle(
+                          fontSize: 13,
+                          fontWeight: FontWeight.bold,
+                          color: AppColors.textDark,
+                        ),
+                      ),
+                      const SizedBox(height: 2),
+                      Text(
+                        bubbleOn
+                            ? AppStrings.t('bubble_mode_on_desc')
+                            : AppStrings.t('bubble_mode_off_desc'),
+                        style: const TextStyle(
+                          fontSize: 11,
+                          color: AppColors.textGray,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                Switch(
+                  value: bubbleOn,
+                  activeThumbColor: AppColors.primaryPurple,
+                  onChanged: (val) {
+                    HapticFeedback.selectionClick();
+                    setState(() {
+                      AppEngineService.instance.isBubblePrivacyActive = val;
+                    });
+                    AppEngineService.instance.pushLiveLocationToServer(
+                      circleCode: activeCircle.code,
+                      userName: _allMembers[0].name,
+                      point: _allMembers[0].location,
+                      battery: _allMembers[0].battery,
+                      avatarUrl: _allMembers[0].avatarUrl,
+                    );
+                  },
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 10),
+          SingleChildScrollView(
+            scrollDirection: Axis.horizontal,
+            child: Row(
+              children: [
+                _buildDatePill(
+                  AppStrings.t('today'),
+                  _selectedHistoryDayTab == 0,
+                  false,
+                  () => setState(() => _selectedHistoryDayTab = 0),
+                ),
+                const SizedBox(width: 8),
+                _buildDatePill(
+                  AppStrings.t('yesterday'),
+                  _selectedHistoryDayTab == 1,
+                  !isProUser,
+                  () => setState(() => _selectedHistoryDayTab = 1),
+                ),
+                const SizedBox(width: 8),
+                _buildDatePill(
+                  AppStrings.t('days_30'),
+                  _selectedHistoryDayTab == 2,
+                  !isProUser,
+                  () => setState(() => _selectedHistoryDayTab = 2),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 10),
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.all(12),
+            decoration: BoxDecoration(
+              color: const Color(0xFFF8FAFC),
+              borderRadius: BorderRadius.circular(14),
+              border: Border.all(color: const Color(0xFFE2E8F0)),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                if (_selectedHistoryDayTab == 0) ...[
+                  Row(
+                    children: [
+                      const Icon(
+                        Icons.route_rounded,
+                        size: 16,
+                        color: AppColors.primaryPurple,
+                      ),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: Text(
+                          '${AppStrings.t('today')} • ${totalDistKm.toStringAsFixed(2)} km (${member.recentRoute.length} ${AppStrings.t('route_points_unit')})',
+                          style: const TextStyle(
+                            fontSize: 12.5,
+                            fontWeight: FontWeight.bold,
+                            color: AppColors.textDark,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ] else if (_selectedHistoryDayTab == 1) ...[
+                  Text(
+                    '${AppStrings.t('yesterday')} • ${AppStrings.t('history_yesterday_sub')}',
+                    style: const TextStyle(
+                      fontSize: 12.5,
+                      fontWeight: FontWeight.bold,
+                      color: AppColors.textDark,
+                    ),
+                  ),
+                ] else ...[
+                  Text(
+                    '${AppStrings.t('days_30')} • ${AppStrings.t('history_30days_sub')}',
+                    style: const TextStyle(
+                      fontSize: 12.5,
+                      fontWeight: FontWeight.bold,
+                      color: AppColors.textDark,
+                    ),
+                  ),
+                ],
+              ],
+            ),
+          ),
+        ],
+      );
+    }
+
+    // 상대방(가족/친구)을 클릭했을 때: [📞 전화] [💬 문자] [🧭 길찾기] + 파스텔 그라데이션 이모지 8종 가로 스크롤 바
     return Column(
       mainAxisSize: MainAxisSize.min,
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -3108,16 +3820,16 @@ class _MainLife360MapScreenState extends State<MainLife360MapScreen>
                     ),
                     onPressed: () => setState(() => selectedMemberId = null),
                   ),
-                  _buildMemberAvatarImage(member, size: 30),
+                  _buildMemberAvatarImage(member, size: 32),
                   const SizedBox(width: 8),
                   Flexible(
                     child: Text(
-                      '${member.name} • ${AppStrings.t('history_title')}',
+                      member.name,
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
                       style: const TextStyle(
-                        fontSize: 15,
-                        fontWeight: FontWeight.bold,
+                        fontSize: 16,
+                        fontWeight: FontWeight.w900,
                         color: AppColors.textDark,
                       ),
                     ),
@@ -3125,146 +3837,171 @@ class _MainLife360MapScreenState extends State<MainLife360MapScreen>
                 ],
               ),
             ),
-            const SizedBox(width: 6),
-            if (isMe)
-              OutlinedButton.icon(
-                style: OutlinedButton.styleFrom(
-                  foregroundColor: AppColors.primaryPurple,
-                  side: const BorderSide(color: AppColors.primaryPurple),
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 10,
-                    vertical: 6,
+            Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                // 📞 스마트폰 기본 전화 직통 버튼
+                InkWell(
+                  onTap: () => _handleMemberPhoneAction(
+                    member: member,
+                    isCall: true,
                   ),
-                  shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(18),
-                  ),
-                ),
-                onPressed: _showMultiCircleSwitcherSheet,
-                icon: const Icon(Icons.edit_rounded, size: 13),
-                label: Text(
-                  AppStrings.t('edit_profile_short'),
-                  style: const TextStyle(
-                    fontSize: 11.5,
-                    fontWeight: FontWeight.bold,
-                  ),
-                ),
-              )
-            else
-              Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  IconButton(
-                    visualDensity: VisualDensity.compact,
-                    tooltip: AppStrings.t('block_member_btn'),
-                    icon: const Icon(
-                      Icons.block_rounded,
-                      size: 18,
-                      color: Colors.redAccent,
+                  borderRadius: BorderRadius.circular(20),
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 10,
+                      vertical: 6,
                     ),
-                    onPressed: () {
-                      setState(() {
-                        _blockedMemberIds.add(member.id);
-                        selectedMemberId = null;
-                      });
-                      ScaffoldMessenger.of(context).showSnackBar(
-                        SnackBar(
-                          backgroundColor: Colors.redAccent,
-                          content: Text(AppStrings.t('block_member_toast')),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFFD1FAE5),
+                      borderRadius: BorderRadius.circular(18),
+                      border: Border.all(color: const Color(0xFF10B981)),
+                    ),
+                    child: Row(
+                      children: [
+                        const Icon(
+                          Icons.call_rounded,
+                          size: 14,
+                          color: Color(0xFF047857),
                         ),
-                      );
-                    },
-                  ),
-                  ElevatedButton.icon(
-                    style: ElevatedButton.styleFrom(
-                      backgroundColor: AppColors.primaryPurple,
-                      foregroundColor: Colors.white,
-                      elevation: 0,
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 10,
-                        vertical: 6,
-                      ),
-                      shape: RoundedRectangleBorder(
-                        borderRadius: BorderRadius.circular(18),
-                      ),
-                    ),
-                    onPressed: () {
-                      AppEngineService.openRealMapNavigation(
-                        dest: member.location,
-                        addressHint: member.statusText,
-                      );
-                    },
-                    icon: const Icon(Icons.directions_rounded, size: 14),
-                    label: Text(
-                      AppStrings.t('directions_btn'),
-                      style: const TextStyle(
-                        fontSize: 11.5,
-                        fontWeight: FontWeight.bold,
-                      ),
+                        const SizedBox(width: 4),
+                        Text(
+                          AppStrings.t('call_btn'),
+                          style: const TextStyle(
+                            fontSize: 11.5,
+                            fontWeight: FontWeight.bold,
+                            color: Color(0xFF047857),
+                          ),
+                        ),
+                      ],
                     ),
                   ),
-                ],
-              ),
+                ),
+                const SizedBox(width: 6),
+                // 💬 스마트폰 기본 문자 직통 버튼
+                InkWell(
+                  onTap: () => _handleMemberPhoneAction(
+                    member: member,
+                    isCall: false,
+                  ),
+                  borderRadius: BorderRadius.circular(20),
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 10,
+                      vertical: 6,
+                    ),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFFDBEAFE),
+                      borderRadius: BorderRadius.circular(18),
+                      border: Border.all(color: const Color(0xFF3B82F6)),
+                    ),
+                    child: Row(
+                      children: [
+                        const Icon(
+                          Icons.sms_rounded,
+                          size: 14,
+                          color: Color(0xFF1D4ED8),
+                        ),
+                        const SizedBox(width: 4),
+                        Text(
+                          AppStrings.t('sms_btn'),
+                          style: const TextStyle(
+                            fontSize: 11.5,
+                            fontWeight: FontWeight.bold,
+                            color: Color(0xFF1D4ED8),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 6),
+                // 🧭 내비게이션 길찾기 버튼
+                ElevatedButton.icon(
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: AppColors.primaryPurple,
+                    foregroundColor: Colors.white,
+                    elevation: 0,
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 10,
+                      vertical: 6,
+                    ),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(18),
+                    ),
+                  ),
+                  onPressed: () {
+                    AppEngineService.openRealMapNavigation(
+                      dest: member.location,
+                      addressHint: member.statusText,
+                    );
+                  },
+                  icon: const Icon(Icons.directions_rounded, size: 14),
+                  label: Text(
+                    AppStrings.t('directions_btn'),
+                    style: const TextStyle(
+                      fontSize: 11.5,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                ),
+              ],
+            ),
           ],
         ),
-        const SizedBox(height: 8),
+        const SizedBox(height: 10),
+        // ✨ Life360을 뛰어넘는 좌우 스크롤 파스텔 그라데이션 이모지 퀵 노트 8종 바
         SingleChildScrollView(
           scrollDirection: Axis.horizontal,
+          physics: const BouncingScrollPhysics(),
           child: Row(
-            children: [
-              ...quickPingList.map(
-                (pingLabel) => Padding(
-                  padding: const EdgeInsets.only(right: 8.0),
-                  child: ActionChip(
-                    backgroundColor: AppColors.lightPurpleBg,
-                    side: BorderSide(
-                      color: AppColors.primaryPurple.withValues(alpha: 0.3),
+            children: emojiQuickNotes.map((item) {
+              final String key = item['key'] as String;
+              final bgList = item['bg'] as List;
+              final bgColors = [bgList[0] as Color, bgList[1] as Color];
+              final Color borderColor = item['border'] as Color;
+              final Color textColor = item['text'] as Color;
+              return Padding(
+                padding: const EdgeInsets.only(right: 8.0),
+                child: InkWell(
+                  onTap: () => _sendQuickPingToMember(member, key),
+                  borderRadius: BorderRadius.circular(22),
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 14,
+                      vertical: 8,
                     ),
-                    label: Text(
-                      pingLabel,
-                      style: const TextStyle(
-                        fontSize: 12,
-                        fontWeight: FontWeight.bold,
-                        color: AppColors.primaryPurple,
+                    decoration: BoxDecoration(
+                      gradient: LinearGradient(
+                        colors: bgColors,
+                        begin: Alignment.topLeft,
+                        end: Alignment.bottomRight,
                       ),
-                    ),
-                    onPressed: () => _sendQuickPingToMember(member, pingLabel),
-                  ),
-                ),
-              ),
-              GestureDetector(
-                onTapDown: (_) => _startPttRecording(member.name, member.id),
-                onTapUp: (_) => _stopAndSendPttRecording(member.id),
-                onTapCancel: () => _stopAndSendPttRecording(member.id),
-                child: Container(
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 12,
-                    vertical: 8,
-                  ),
-                  decoration: BoxDecoration(
-                    color: AppColors.primaryPurple,
-                    borderRadius: BorderRadius.circular(20),
-                  ),
-                  child: Row(
-                    children: [
-                      const Icon(
-                        Icons.mic_rounded,
-                        size: 14,
-                        color: Colors.white,
+                      borderRadius: BorderRadius.circular(22),
+                      border: Border.all(
+                        color: borderColor.withValues(alpha: 0.55),
+                        width: 1.3,
                       ),
-                      const SizedBox(width: 4),
-                      Text(
-                        AppStrings.t('ping_4'),
-                        style: const TextStyle(
-                          fontSize: 12,
-                          fontWeight: FontWeight.bold,
-                          color: Colors.white,
+                      boxShadow: [
+                        BoxShadow(
+                          color: borderColor.withValues(alpha: 0.16),
+                          blurRadius: 6,
+                          offset: const Offset(0, 2),
                         ),
+                      ],
+                    ),
+                    child: Text(
+                      AppStrings.t(key),
+                      style: TextStyle(
+                        fontSize: 12.5,
+                        fontWeight: FontWeight.w800,
+                        color: textColor,
                       ),
-                    ],
+                    ),
                   ),
                 ),
-              ),
-            ],
+              );
+            }).toList(),
           ),
         ),
         const SizedBox(height: 12),
@@ -3297,60 +4034,76 @@ class _MainLife360MapScreenState extends State<MainLife360MapScreen>
             ],
           ),
         ),
-        const SizedBox(height: 14),
-        Row(
-          children: [
-            const Icon(Icons.circle, size: 10, color: AppColors.primaryPurple),
-            const SizedBox(width: 10),
-            Expanded(
-              child: Text(
-                displayHistorySub,
-                style: const TextStyle(
-                  fontSize: 13.5,
-                  fontWeight: FontWeight.w600,
-                  color: AppColors.textDark,
-                ),
-              ),
-            ),
-          ],
-        ),
-        if (!isProUser) ...[
-          const SizedBox(height: 12),
-          InkWell(
-            onTap: _showProPaywallSheet,
-            child: Container(
-              width: double.infinity,
-              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
-              decoration: BoxDecoration(
-                color: AppColors.lightPurpleBg,
-                borderRadius: BorderRadius.circular(14),
-              ),
-              child: Row(
+        const SizedBox(height: 10),
+        Container(
+          padding: const EdgeInsets.all(12),
+          decoration: BoxDecoration(
+            color: const Color(0xFFF8FAFC),
+            borderRadius: BorderRadius.circular(14),
+            border: Border.all(color: const Color(0xFFE2E8F0)),
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
                 children: [
+                  const Icon(
+                    Icons.place_rounded,
+                    size: 16,
+                    color: AppColors.primaryPurple,
+                  ),
+                  const SizedBox(width: 8),
                   Expanded(
                     child: Text(
-                      AppStrings.t('upgrade_pro'),
+                      '$tNow • $cleanAddr',
                       style: const TextStyle(
                         fontSize: 12.5,
                         fontWeight: FontWeight.bold,
-                        color: AppColors.primaryPurple,
+                        color: AppColors.textDark,
                       ),
                     ),
                   ),
+                ],
+              ),
+              const Padding(
+                padding: EdgeInsets.only(left: 7, top: 2, bottom: 2),
+                child: SizedBox(
+                  height: 10,
+                  child: VerticalDivider(
+                    width: 2,
+                    thickness: 1.5,
+                    color: Color(0xFFCBD5E1),
+                  ),
+                ),
+              ),
+              Row(
+                children: [
                   const Icon(
-                    Icons.arrow_forward_ios_rounded,
-                    size: 13,
-                    color: AppColors.primaryPurple,
+                    Icons.directions_walk_rounded,
+                    size: 15,
+                    color: AppColors.safeGreenText,
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      member.recentRoute.length > 1
+                          ? '$tPrev1 ~ $tNow • ${totalDistKm.toStringAsFixed(2)}km (${member.speedKmh.toStringAsFixed(1)}km/h)'
+                          : '$tPrev2 ~ $tNow • ${AppStrings.t('status_staying')}',
+                      style: const TextStyle(
+                        fontSize: 11.5,
+                        fontWeight: FontWeight.w600,
+                        color: AppColors.textGray,
+                      ),
+                    ),
                   ),
                 ],
               ),
-            ),
+            ],
           ),
-        ],
+        ),
       ],
     );
   }
-
   Widget _buildDatePill(
     String label,
     bool active,
@@ -3411,4 +4164,3 @@ class _PinTailPainter extends CustomPainter {
   bool shouldRepaint(covariant _PinTailPainter oldDelegate) =>
       oldDelegate.color != color;
 }
-

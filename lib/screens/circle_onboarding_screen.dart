@@ -1,4 +1,7 @@
-﻿import 'package:flutter/material.dart';
+import 'dart:convert';
+import 'dart:io';
+
+import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import '../core/app_theme_and_strings.dart';
@@ -26,12 +29,60 @@ class _CircleInviteScreenState extends State<CircleInviteScreen> {
   String _generatedCode = AppEngineService.generateRandomInviteCode();
   bool _isCodeVerified = false;
 
+  File get _sessionFile =>
+      File('${Directory.systemTemp.path}/pingo_saved_session_v1.json');
+
   @override
   void initState() {
     super.initState();
     _circleNameController = TextEditingController(
       text: AppStrings.t('preset_family'),
     );
+    _restoreSavedSessionIfExists();
+  }
+
+  Future<void> _restoreSavedSessionIfExists() async {
+    try {
+      if (await _sessionFile.exists()) {
+        final raw = await _sessionFile.readAsString();
+        final data = jsonDecode(raw) as Map<String, dynamic>;
+        final savedUserName = (data['userName'] as String?)?.trim() ?? '';
+        final savedAvatarUrl =
+            (data['avatarUrl'] as String?)?.trim() ??
+            PingoAvatars.presets[0]['url']!;
+        final savedCircleName =
+            (data['circleName'] as String?)?.trim() ??
+            AppStrings.t('preset_family');
+        final savedCode = (data['code'] as String?)?.trim() ?? '';
+        final savedRole = (data['role'] as String?)?.trim() ?? 'member';
+          final savedUid = (data['deviceUserId'] as String?)?.trim() ?? '';
+          if (savedUid.isNotEmpty) { AppEngineService.instance.setPersistentDeviceUserId(savedUid); }
+
+        if (savedUserName.isNotEmpty && savedCode.isNotEmpty && mounted) {
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            if (!mounted) return;
+            Navigator.pushReplacement(
+              context,
+              MaterialPageRoute(
+                builder: (_) => MainLife360MapScreen(
+                  userName: savedUserName,
+                  userAvatarUrl: savedAvatarUrl,
+                  initialCircles: [
+                    CircleInfo(
+                      name: savedCircleName,
+                      code: savedCode,
+                      myRole: savedRole,
+                    ),
+                  ],
+                ),
+              ),
+            );
+          });
+          return;
+        }
+      }
+    } catch (_) {}
+
   }
 
   @override
@@ -62,16 +113,30 @@ class _CircleInviteScreenState extends State<CircleInviteScreen> {
     return raw.isEmpty ? AppStrings.t('me_default') : raw;
   }
 
-  void _goToMainMap({
+  Future<void> _goToMainMap({
     required String circleName,
     required String code,
     required String role,
-  }) {
+  }) async {
     final userName = _ensureUserName();
     final finalCircleName = circleName.trim().isEmpty
         ? AppStrings.t('preset_family')
         : circleName;
 
+    try {
+      await _sessionFile.writeAsString(
+        jsonEncode({
+          'userName': userName,
+          'avatarUrl': _selectedAvatarUrl,
+          'circleName': finalCircleName,
+          'code': code,
+          'role': role,
+          'deviceUserId': AppEngineService.instance.currentUserId,
+        }),
+      );
+    } catch (_) {}
+
+    if (!mounted) return;
     Navigator.pushReplacement(
       context,
       MaterialPageRoute(

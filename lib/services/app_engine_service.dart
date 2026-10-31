@@ -1,500 +1,671 @@
-﻿import 'dart:async';
+import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 import 'dart:math' as math;
-
-import 'package:audioplayers/audioplayers.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
 import 'package:image_picker/image_picker.dart';
-import 'package:latlong2/latlong.dart';
 import 'package:in_app_purchase/in_app_purchase.dart';
-import 'package:record/record.dart';
+import 'package:latlong2/latlong.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import 'package:url_launcher/url_launcher.dart';
-
 import '../core/app_theme_and_strings.dart';
+import '../models/app_models.dart';
 
 class AppEngineService {
   AppEngineService._();
   static final AppEngineService instance = AppEngineService._();
 
-  final AudioRecorder _audioRecorder = AudioRecorder();
-  final AudioPlayer _audioPlayer = AudioPlayer();
+  bool isSupabaseReady = false;
+  bool isProUser = false;
+  bool isSharingLocation = true;
+  bool isBubblePrivacyActive = false;
+  bool isAlertMuted = false;
+  bool showDemoWhenAlone = true;
+  int mapStyleIndex = 0;
 
-  String? lastRecordedAudioSource;
-  bool _isMicRecordingActive = false;
+  String currentUserId = '';
+  String myCustomAvatarDataUrl = '';
+  String myPhoneNumber = '';
+  String activeSignalEnvelope = '';
+  DateTime? activeSignalExpiresAt;
 
-  String _deviceUserId =
-      'pingo_user_${DateTime.now().millisecondsSinceEpoch.toString().substring(7)}';
-  String get currentUserId =>
-      Supabase.instance.client.auth.currentUser?.id ?? _deviceUserId;
+  static const String proMonthlyProductId = 'pingo_pro_monthly';
+  static const String proYearlyProductId = 'pingo_pro_yearly';
+  static const String kProMonthlyId = 'pingo_pro_monthly';
+  static const String kProYearlyId = 'pingo_pro_yearly';
 
-  static String generateRandomInviteCode() {
-    const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-    final rnd = math.Random();
-    return List.generate(6, (_) => chars[rnd.nextInt(chars.length)]).join();
+  final Map<String, String> _roadAddressCache = {};
+  final Map<String, LatLng> _lastGeocodedCoordByKey = {};
+  final Map<String, DateTime> _lastGeocodedTimeByKey = {};
+  final Map<String, String> memberPhones = {};
+  final Map<String, bool> circleHiddenMap = {};
+  final Set<String> blockedUserIds = {};
+
+  Map<String, String> get memberPhoneBook => memberPhones;
+
+  DateTime? _lastServerPushTime;
+  LatLng? _lastServerPushLatLng;
+  StreamSubscription<List<PurchaseDetails>>? _iapSubscription;
+
+  static const List<String> presetEmojiAvatars = [
+    'avatar:😊',
+    'avatar:😎',
+    'avatar:🦊',
+    'avatar:🐱',
+    'avatar:🐶',
+    'avatar:🐼',
+    'avatar:🐰',
+    'avatar:🦁',
+    'avatar:🐸',
+    'avatar:🦄',
+    'avatar:👑',
+    'avatar:🚀',
+  ];
+
+  String get currentMapboxStyleId {
+    if (mapStyleIndex == 1) return 'mapbox/streets-v12';
+    if (mapStyleIndex == 2) return 'mapbox/dark-v11';
+    return AppConfig.mapboxStyleId;
+  }
+
+  String buildCircleScopedUserId(String circleCode) {
+    final base = currentUserId.isEmpty ? '00000000-0000-4000-8000-000000000000' : currentUserId;
+    final cleanCode = circleCode.replaceAll(RegExp(r'[^0-9A-Za-z]'), '').toLowerCase().padRight(6, '0');
+    final hexSuffix = cleanCode.codeUnits.take(6).map((c) => (c % 16).toRadixString(16)).join();
+    if (base.length >= 36 && base.contains('-')) {
+      return '${base.substring(0, 30)}$hexSuffix';
+    }
+    return base;
+  }
+
+  Future<void> initializeServices() async {
+    await ensureAnonymousSession();
   }
 
   Future<void> ensureAnonymousSession() async {
+    await _loadOrGeneratePersistentDeviceId();
     try {
-      final auth = Supabase.instance.client.auth;
-      if (auth.currentSession == null) {
-        final res = await auth.signInAnonymously();
-        if (res.user != null) {
-          _deviceUserId = res.user!.id;
-        }
-      }
-    } catch (_) {}
+      await Supabase.initialize(
+        url: AppConfig.supabaseUrl,
+        anonKey: AppConfig.supabaseAnonKey,
+      );
+      isSupabaseReady = true;
+    } catch (_) {
+      isSupabaseReady = true;
+    }
+    _initInAppPurchaseListener();
   }
 
-  Future<bool> startRealPttVoiceRecording() async {
+  Future<void> setPersistentDeviceUserId(String customSeed) async {
+    await _loadOrGeneratePersistentDeviceId();
+  }
+
+  Future<void> _loadOrGeneratePersistentDeviceId() async {
     try {
-      await SystemSound.play(SystemSoundType.click);
-      final hasPerm = await _audioRecorder.hasPermission();
-      if (!hasPerm) {
-        _isMicRecordingActive = false;
-        return false;
+      final file = File('${Directory.systemTemp.path}/pingo_device_identity_v2.txt');
+      if (await file.exists()) {
+        final saved = (await file.readAsString()).trim();
+        if (saved.length >= 32) {
+          currentUserId = saved;
+          return;
+        }
       }
-
-      const config = RecordConfig(
-        encoder: kIsWeb ? AudioEncoder.wav : AudioEncoder.aacLc,
-        bitRate: 32000,
-        sampleRate: 16000,
-        numChannels: 1,
-      );
-
-      await _audioRecorder.start(
-        config,
-        path: kIsWeb
-            ? ''
-            : 'pingo_ptt_${DateTime.now().millisecondsSinceEpoch}.m4a',
-      );
-      _isMicRecordingActive = true;
-      return true;
+      final rnd = math.Random.secure();
+      String hex(int len) => List.generate(len, (_) => rnd.nextInt(16).toRadixString(16)).join();
+      currentUserId = '${hex(8)}-${hex(4)}-4${hex(3)}-8${hex(3)}-${hex(12)}';
+      await file.writeAsString(currentUserId, flush: true);
     } catch (_) {
-      _isMicRecordingActive = false;
+      final rnd = math.Random();
+      String hex(int len) => List.generate(len, (_) => rnd.nextInt(16).toRadixString(16)).join();
+      currentUserId = '${hex(8)}-${hex(4)}-4${hex(3)}-8${hex(3)}-${hex(12)}';
+    }
+  }
+
+  static String generateRandomInviteCode() {
+    final rnd = math.Random();
+    return (100000 + rnd.nextInt(900000)).toString();
+  }
+
+  Future<String> generateUniqueCircleCode() async {
+    return generateRandomInviteCode();
+  }
+
+  double calculateDistanceMeters(LatLng a, LatLng b) {
+    return const Distance().as(LengthUnit.Meter, a, b);
+  }
+
+  Future<bool> savePhoneForMember(String memberId, String phone) async {
+    final cleaned = phone.trim();
+    if (cleaned.isEmpty) return false;
+    memberPhones[memberId] = cleaned;
+    return true;
+  }
+
+  static Future<bool> launchNativePhoneCall(String rawPhone) async {
+    final clean = rawPhone.replaceAll(RegExp(r'[^0-9+]'), '');
+    if (clean.isEmpty) return false;
+    final uri = Uri(scheme: 'tel', path: clean);
+    try {
+      return await launchUrl(uri, mode: LaunchMode.externalApplication);
+    } catch (_) {
       return false;
     }
   }
 
-  Future<String?> stopAndPlayRealPttVoice() async {
+  static Future<bool> launchNativeSms({
+    String? phone,
+    String? rawPhone,
+    String? bodyText,
+    String? body,
+  }) async {
+    final targetPhone = (phone ?? rawPhone ?? '').replaceAll(RegExp(r'[^0-9+]'), '');
+    final msg = bodyText ?? body ?? '';
+    final Uri uri = msg.isNotEmpty
+        ? Uri(
+            scheme: 'sms',
+            path: targetPhone,
+            queryParameters: <String, String>{'body': msg},
+          )
+        : Uri(scheme: 'sms', path: targetPhone);
     try {
-      await SystemSound.play(SystemSoundType.click);
-      if (!_isMicRecordingActive) return null;
-      _isMicRecordingActive = false;
-
-      final recordedPath = await _audioRecorder.stop();
-      if (recordedPath == null || recordedPath.isEmpty) return null;
-
-      lastRecordedAudioSource = recordedPath;
-      await playVoiceSource(recordedPath);
-
-      try {
-        final bytes = await XFile(recordedPath).readAsBytes();
-        if (bytes.isNotEmpty && bytes.length < 150000) {
-          final mime = kIsWeb ? 'audio/wav' : 'audio/mp4';
-          return 'data:$mime;base64,${base64Encode(bytes)}';
-        }
-      } catch (_) {}
-      return recordedPath;
+      return await launchUrl(uri, mode: LaunchMode.externalApplication);
     } catch (_) {
-      _isMicRecordingActive = false;
-      return null;
+      return false;
     }
   }
 
-  Future<void> playVoiceSource(String source) async {
-    try {
-      await _audioPlayer.stop();
-      if (source.startsWith('data:audio')) {
-        final commaIdx = source.indexOf(',');
-        if (commaIdx != -1) {
-          final b64 = source.substring(commaIdx + 1);
-          final bytes = base64Decode(b64);
-          await _audioPlayer.play(BytesSource(bytes));
-          return;
-        }
-      }
-      if (kIsWeb || source.startsWith('http') || source.startsWith('blob:')) {
-        await _audioPlayer.play(UrlSource(source));
-      } else {
-        await _audioPlayer.play(DeviceFileSource(source));
-      }
-    } catch (_) {}
-  }
-
-  Future<String> fetchRoadAddress(LatLng point) async {
-    final langCode = AppStrings.lang;
-    final url = Uri.parse(
-      'https://api.mapbox.com/geocoding/v5/mapbox.places/${point.longitude},${point.latitude}.json?access_token=${AppConfig.mapboxToken}&language=$langCode&limit=1',
-    );
-    try {
-      final res = await http.get(url).timeout(const Duration(seconds: 4));
-      if (res.statusCode == 200) {
-        final data = jsonDecode(res.body) as Map<String, dynamic>;
-        final features = data['features'] as List<dynamic>?;
-        if (features != null && features.isNotEmpty) {
-          final placeName = features.first['place_name'] as String?;
-          if (placeName != null && placeName.isNotEmpty) {
-            return placeName
-                .replaceAll('대한민국 ', '')
-                .replaceAll('South Korea, ', '');
-          }
-        }
-      }
-    } catch (_) {}
-    return AppStrings.t('syncing_address');
-  }
-
-  Future<List<LatLng>> fetchRoadSnappedRoute(
-    LatLng start,
-    LatLng end, {
-    String profile = 'walking',
+  static Future<void> openExternalLegalUrl({
+    bool isTermsOfUse = true,
+    String? rawUrl,
   }) async {
-    final url = Uri.parse(
-      'https://api.mapbox.com/directions/v5/mapbox/$profile/${start.longitude},${start.latitude};${end.longitude},${end.latitude}?geometries=geojson&overview=full&access_token=${AppConfig.mapboxToken}',
-    );
+    final target = rawUrl ??
+        (isTermsOfUse
+            ? 'https://jeong-giseong.github.io/pingo-terms.html'
+            : 'https://jeong-giseong.github.io/pingo-privacy.html');
     try {
-      final res = await http.get(url).timeout(const Duration(seconds: 5));
-      if (res.statusCode == 200) {
-        final data = jsonDecode(res.body) as Map<String, dynamic>;
-        final routes = data['routes'] as List<dynamic>?;
-        if (routes != null && routes.isNotEmpty) {
-          final geometry = routes.first['geometry'] as Map<String, dynamic>?;
-          final coords = geometry?['coordinates'] as List<dynamic>?;
-          if (coords != null && coords.isNotEmpty) {
-            return coords.map((c) {
-              final pair = c as List<dynamic>;
-              return LatLng(
-                (pair[1] as num).toDouble(),
-                (pair[0] as num).toDouble(),
-              );
-            }).toList();
-          }
-        }
-      }
+      final uri = Uri.parse(target);
+      await launchUrl(uri, mode: LaunchMode.externalApplication);
     } catch (_) {}
-
-    return List.generate(20, (i) {
-      final t = i / 19.0;
-      return LatLng(
-        start.latitude + (end.latitude - start.latitude) * t,
-        start.longitude + (end.longitude - start.longitude) * t,
-      );
-    });
   }
 
-  double calculateDistanceMeters(LatLng a, LatLng b) {
-    const earthRadius = 6371000.0;
-    final dLat = _degToRad(b.latitude - a.latitude);
-    final dLon = _degToRad(b.longitude - a.longitude);
-    final lat1 = _degToRad(a.latitude);
-    final lat2 = _degToRad(b.latitude);
-
-    final h =
-        math.sin(dLat / 2) * math.sin(dLat / 2) +
-        math.cos(lat1) *
-            math.cos(lat2) *
-            math.sin(dLon / 2) *
-            math.sin(dLon / 2);
-    final c = 2 * math.atan2(math.sqrt(h), math.sqrt(1 - h));
-    return earthRadius * c;
-  }
-
-  double _degToRad(double deg) => deg * (math.pi / 180.0);
-
-  Future<void> pushLiveLocationToServer({
-    required String circleCode,
-    required String userName,
-    required LatLng point,
-    required int battery,
-    String? avatarUrl,
-    String? audioClipDataUrl,
-    double speedKmh = 0.0,
-    bool isSos = false,
-  }) async {
-    final basePayload = <String, dynamic>{
-      'user_id': currentUserId,
-      'circle_code': circleCode,
-      'user_name': userName,
-      'latitude': point.latitude,
-      'longitude': point.longitude,
-      'battery_level': battery,
-      'speed_kmh': speedKmh,
-      'is_sos': isSos,
-      'updated_at': DateTime.now().toIso8601String(),
-    };
-
-    try {
-      final extPayload = Map<String, dynamic>.from(basePayload);
-      if (avatarUrl != null) extPayload['avatar_url'] = avatarUrl;
-      if (audioClipDataUrl != null) extPayload['audio_clip'] = audioClipDataUrl;
-      await Supabase.instance.client.from('locations').upsert(extPayload);
-    } catch (_) {
-      try {
-        await Supabase.instance.client.from('locations').upsert(basePayload);
-      } catch (_) {}
-    }
-  }
-
-  Future<void> deleteMyServerDataAndReset() async {
-    try {
-      await Supabase.instance.client
-          .from('locations')
-          .delete()
-          .eq('user_id', currentUserId);
-    } catch (_) {}
-    lastRecordedAudioSource = null;
-  }
-
-  static const String proMonthlyProductId = 'pingo_pro_monthly';
-  static const String proYearlyProductId = 'pingo_pro_yearly';
-
-  Future<bool> purchaseProSubscription({
-    required String productId,
-    required VoidCallback onActivated,
-  }) async {
-    try {
-      final iap = InAppPurchase.instance;
-      final available = await iap.isAvailable();
-      if (available) {
-        final response = await iap.queryProductDetails({productId});
-        if (response.productDetails.isNotEmpty) {
-          final param = PurchaseParam(
-            productDetails: response.productDetails.first,
-          );
-          await iap.buyNonConsumable(purchaseParam: param);
-          onActivated();
-          return true;
-        }
-      }
-    } catch (_) {}
-    onActivated();
-    return false;
-  }
-
-  Future<void> restoreProPurchases({required VoidCallback onRestored}) async {
-    try {
-      final iap = InAppPurchase.instance;
-      if (await iap.isAvailable()) {
-        await iap.restorePurchases();
-      }
-    } catch (_) {}
-    onRestored();
-  }
-
-  // 🚗 [길찾기 완벽 수정] 깨진 좌표 기호 대신 실제 도로명 주소를 목적지로 전달 & 한국 내 도보 모드 충돌 완전 제거!
   static Future<void> openRealMapNavigation({
     required LatLng dest,
     String? addressHint,
   }) async {
-    String cleanDest = '${dest.latitude},${dest.longitude}';
-    if (addressHint != null && addressHint.isNotEmpty) {
-      final addrPart = addressHint.split('•').first.trim();
-      if (addrPart.isNotEmpty &&
-          !addrPart.contains('...') &&
-          addrPart != 'LIVE') {
-        cleanDest = addrPart;
-      }
-    }
-
-    final encodedDest = Uri.encodeComponent(cleanDest);
-    final uri = Uri.parse(
-      'https://www.google.com/maps/dir/?api=1&destination=$encodedDest&hl=${AppStrings.lang}',
+    final url = Uri.parse(
+      'https://www.google.com/maps/dir/?api=1&destination=${dest.latitude},${dest.longitude}',
     );
     try {
-      await launchUrl(uri, mode: LaunchMode.externalApplication);
+      await launchUrl(url, mode: LaunchMode.externalApplication);
     } catch (_) {}
   }
 
-  static Future<void> openExternalLegalUrl({required bool isTermsOfUse}) async {
-    final docLang = AppStrings.lang == 'ko' ? 'ko' : 'en';
-    final baseUrl = isTermsOfUse
-        ? AppConfig.termsOfUseUrl
-        : AppConfig.privacyPolicyUrl;
-    final uri = Uri.parse('$baseUrl&lang=$docLang');
-
-    try {
-      await launchUrl(uri, mode: LaunchMode.externalApplication);
-    } catch (_) {}
-  }
-
-  static void showAvatarAndPhotoPickerModal({
+  static Future<String?> showAvatarAndPhotoPickerModal({
     required BuildContext context,
-    required String currentAvatarUrl,
-    required ValueChanged<String> onSelected,
-  }) {
-    final ImagePicker picker = ImagePicker();
-
-    showModalBottomSheet(
+    String? currentAvatarUrl,
+    String? currentAvatar,
+    ValueChanged<String>? onSelected,
+  }) async {
+    final picker = ImagePicker();
+    final activeAvatar = currentAvatarUrl ?? currentAvatar;
+    return showModalBottomSheet<String>(
       context: context,
-      isScrollControlled: true,
-      backgroundColor: AppColors.cardWhite,
+      backgroundColor: Colors.white,
       shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(28)),
+        borderRadius: BorderRadius.vertical(top: Radius.circular(26)),
       ),
-      builder: (ctx) => Padding(
-        padding: const EdgeInsets.fromLTRB(22, 16, 22, 26),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Center(
-              child: Container(
-                width: 40,
-                height: 4,
-                decoration: BoxDecoration(
-                  color: const Color(0xFFD1D5DB),
-                  borderRadius: BorderRadius.circular(10),
-                ),
-              ),
-            ),
-            const SizedBox(height: 14),
-            Row(
-              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+      builder: (ctx) {
+        return SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(20, 16, 20, 20),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Expanded(
-                  child: Text(
-                    AppStrings.t('avatar_sheet_title'),
-                    style: const TextStyle(
-                      fontSize: 18,
-                      fontWeight: FontWeight.bold,
-                      color: AppColors.textDark,
-                    ),
-                  ),
+                Text(
+                  AppStrings.t('avatar_picker_title'),
+                  style: const TextStyle(fontSize: 17, fontWeight: FontWeight.w900),
                 ),
-                IconButton(
-                  icon: const Icon(Icons.close_rounded),
-                  onPressed: () => Navigator.pop(ctx),
+                const SizedBox(height: 12),
+                Row(
+                  children: [
+                    Expanded(
+                      child: ElevatedButton.icon(
+                        onPressed: () async {
+                          try {
+                            final xfile = await picker.pickImage(
+                              source: ImageSource.gallery,
+                              maxWidth: 180,
+                              maxHeight: 180,
+                              imageQuality: 40,
+                            );
+                            if (xfile != null) {
+                              final bytes = await xfile.readAsBytes();
+                              final dataUrl = 'data:image/jpeg;base64,${base64Encode(bytes)}';
+                              instance.myCustomAvatarDataUrl = dataUrl;
+                              if (onSelected != null) onSelected(dataUrl);
+                              if (ctx.mounted) Navigator.pop(ctx, dataUrl);
+                            }
+                          } catch (_) {}
+                        },
+                        icon: const Icon(Icons.photo_library_rounded, size: 18),
+                        label: Text(AppStrings.t('pick_photo_gallery')),
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: const Color(0xFF6C47FF),
+                          foregroundColor: Colors.white,
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: OutlinedButton.icon(
+                        onPressed: () async {
+                          try {
+                            final xfile = await picker.pickImage(
+                              source: ImageSource.camera,
+                              maxWidth: 180,
+                              maxHeight: 180,
+                              imageQuality: 40,
+                            );
+                            if (xfile != null) {
+                              final bytes = await xfile.readAsBytes();
+                              final dataUrl = 'data:image/jpeg;base64,${base64Encode(bytes)}';
+                              instance.myCustomAvatarDataUrl = dataUrl;
+                              if (onSelected != null) onSelected(dataUrl);
+                              if (ctx.mounted) Navigator.pop(ctx, dataUrl);
+                            }
+                          } catch (_) {}
+                        },
+                        icon: const Icon(Icons.camera_alt_rounded, size: 18),
+                        label: Text(AppStrings.t('pick_photo_camera')),
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 14),
+                Wrap(
+                  spacing: 10,
+                  runSpacing: 10,
+                  children: presetEmojiAvatars.map((item) {
+                    final emoji = item.replaceFirst('avatar:', '');
+                    return GestureDetector(
+                      onTap: () {
+                        instance.myCustomAvatarDataUrl = item;
+                        if (onSelected != null) onSelected(item);
+                        Navigator.pop(ctx, item);
+                      },
+                      child: Container(
+                        width: 48,
+                        height: 48,
+                        alignment: Alignment.center,
+                        decoration: BoxDecoration(
+                          color: const Color(0xFFF4F0FF),
+                          shape: BoxShape.circle,
+                          border: Border.all(
+                            color: activeAvatar == item
+                                ? const Color(0xFF6C47FF)
+                                : const Color(0xFFE4E7EC),
+                            width: 2,
+                          ),
+                        ),
+                        child: Text(emoji, style: const TextStyle(fontSize: 22)),
+                      ),
+                    );
+                  }).toList(),
                 ),
               ],
             ),
-            const SizedBox(height: 10),
-            SizedBox(
-              width: double.infinity,
-              height: 50,
-              child: ElevatedButton.icon(
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: AppColors.lightPurpleBg,
-                  foregroundColor: AppColors.primaryPurple,
-                  elevation: 0,
-                  shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(16),
-                    side: BorderSide(
-                      color: AppColors.primaryPurple.withValues(alpha: 0.35),
-                    ),
-                  ),
-                ),
-                onPressed: () async {
-                  try {
-                    final XFile? file = await picker.pickImage(
-                      source: ImageSource.gallery,
-                      maxWidth: 360,
-                      imageQuality: 80,
-                    );
-                    if (file != null) {
-                      final bytes = await file.readAsBytes();
-                      final dataUrl =
-                          'data:image/jpeg;base64,${base64Encode(bytes)}';
-                      onSelected(dataUrl);
-                      if (ctx.mounted) Navigator.pop(ctx);
-                    }
-                  } catch (_) {}
-                },
-                icon: const Icon(Icons.photo_camera_back_rounded, size: 20),
-                label: Text(
-                  AppStrings.t('upload_my_photo'),
-                  style: const TextStyle(
-                    fontWeight: FontWeight.bold,
-                    fontSize: 14,
-                  ),
-                ),
-              ),
-            ),
-            const SizedBox(height: 18),
-            Text(
-              AppStrings.t('or_select_character'),
-              style: const TextStyle(
-                fontSize: 13,
-                fontWeight: FontWeight.bold,
-                color: AppColors.textGray,
-              ),
-            ),
-            const SizedBox(height: 12),
-            SizedBox(
-              height: 290,
-              child: GridView.builder(
-                itemCount: PingoAvatars.presets.length,
-                gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-                  crossAxisCount: 4,
-                  mainAxisSpacing: 12,
-                  crossAxisSpacing: 12,
-                  childAspectRatio: 0.82,
-                ),
-                itemBuilder: (_, idx) {
-                  final item = PingoAvatars.presets[idx];
-                  final url = item['url']!;
-                  final styleKey = item['styleKey']!;
-                  final isSelected = currentAvatarUrl == url;
-                  return GestureDetector(
-                    onTap: () {
-                      onSelected(url);
-                      Navigator.pop(ctx);
-                    },
-                    child: Column(
-                      children: [
-                        Container(
-                          width: 62,
-                          height: 62,
-                          decoration: BoxDecoration(
-                            shape: BoxShape.circle,
-                            border: Border.all(
-                              color: isSelected
-                                  ? AppColors.primaryPurple
-                                  : const Color(0xFFE5E7EB),
-                              width: isSelected ? 3.2 : 1.5,
-                            ),
-                            boxShadow: isSelected
-                                ? [
-                                    BoxShadow(
-                                      color: AppColors.primaryPurple.withValues(
-                                        alpha: 0.3,
-                                      ),
-                                      blurRadius: 8,
-                                    ),
-                                  ]
-                                : null,
-                          ),
-                          child: ClipOval(
-                            child: Image.network(url, fit: BoxFit.cover),
-                          ),
-                        ),
-                        const SizedBox(height: 4),
-                        Text(
-                          AppStrings.t(styleKey),
-                          overflow: TextOverflow.ellipsis,
-                          style: TextStyle(
-                            fontSize: 10,
-                            fontWeight: isSelected
-                                ? FontWeight.bold
-                                : FontWeight.w500,
-                            color: isSelected
-                                ? AppColors.primaryPurple
-                                : AppColors.textGray,
-                          ),
-                        ),
-                      ],
-                    ),
-                  );
-                },
-              ),
-            ),
-          ],
-        ),
-      ),
+          ),
+        );
+      },
     );
   }
-}
 
+  Future<void> cleanupDuplicateGhostRows({
+    required String circleCode,
+    required String myUserName,
+    String? userName,
+  }) async {
+    if (!isSupabaseReady || currentUserId.isEmpty) return;
+    final targetName = myUserName.isNotEmpty ? myUserName : (userName ?? '');
+    if (targetName.isEmpty) return;
+    try {
+      final scopedId = buildCircleScopedUserId(circleCode);
+      await Supabase.instance.client
+          .from('locations')
+          .delete()
+          .eq('circle_code', circleCode)
+          .eq('user_name', targetName)
+          .neq('user_id', scopedId)
+          .neq('user_id', currentUserId);
+    } catch (_) {}
+  }
+
+  void _initInAppPurchaseListener() {
+    if (kIsWeb) return;
+    try {
+      final purchaseUpdated = InAppPurchase.instance.purchaseStream;
+      _iapSubscription = purchaseUpdated.listen((purchaseDetailsList) {
+        for (final purchaseDetails in purchaseDetailsList) {
+          if (purchaseDetails.status == PurchaseStatus.purchased ||
+              purchaseDetails.status == PurchaseStatus.restored) {
+            isProUser = true;
+            if (purchaseDetails.pendingCompletePurchase) {
+              InAppPurchase.instance.completePurchase(purchaseDetails);
+            }
+          }
+        }
+      }, onError: (_) {});
+    } catch (_) {}
+  }
+
+  Future<bool> purchaseProSubscription({
+    String productId = proYearlyProductId,
+    VoidCallback? onProUnlocked,
+  }) async {
+    final isYearly = productId.contains('year');
+    final ok = await buyProSubscription(isYearly: isYearly);
+    if (ok && onProUnlocked != null) onProUnlocked();
+    return ok;
+  }
+
+  Future<bool> buyProSubscription({bool isYearly = true}) async {
+    if (kIsWeb) {
+      isProUser = true;
+      return true;
+    }
+    try {
+      final available = await InAppPurchase.instance.isAvailable();
+      if (!available) return false;
+      final targetId = isYearly ? kProYearlyId : kProMonthlyId;
+      final response = await InAppPurchase.instance.queryProductDetails({targetId});
+      if (response.productDetails.isNotEmpty) {
+        final param = PurchaseParam(productDetails: response.productDetails.first);
+        await InAppPurchase.instance.buyNonConsumable(purchaseParam: param);
+        return true;
+      }
+      return false;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  Future<bool> restoreProPurchases({VoidCallback? onProUnlocked}) async {
+    if (kIsWeb) {
+      if (isProUser && onProUnlocked != null) onProUnlocked();
+      return isProUser;
+    }
+    try {
+      final available = await InAppPurchase.instance.isAvailable();
+      if (!available) return isProUser;
+      await InAppPurchase.instance.restorePurchases();
+      if (isProUser && onProUnlocked != null) onProUnlocked();
+      return isProUser;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  Future<String> fetchRoadAddress(
+    LatLng point, {
+    double speedKmh = 0.0,
+    List<SafePlaceData>? safePlaces,
+    bool forceLookup = false,
+  }) async {
+    if (!forceLookup && speedKmh >= 4.5) {
+      return '🚗 ${AppStrings.t('Filter_Moving')} (${speedKmh.toStringAsFixed(0)} km/h)';
+    }
+
+    const lang = 'ko';
+    final key = '${point.latitude.toStringAsFixed(3)}_${point.longitude.toStringAsFixed(3)}';
+    if (_roadAddressCache.containsKey(key)) {
+      return _roadAddressCache[key]!;
+    }
+
+    final lastCoord = _lastGeocodedCoordByKey[lang];
+    final lastTime = _lastGeocodedTimeByKey[lang];
+    if (!forceLookup && lastCoord != null && lastTime != null) {
+      final movedMeters = calculateDistanceMeters(lastCoord, point);
+      final elapsedSec = DateTime.now().difference(lastTime).inSeconds;
+      if (movedMeters < 250.0 && elapsedSec < 180 && _roadAddressCache.isNotEmpty) {
+        return _roadAddressCache.values.last;
+      }
+    }
+
+    const token = 'pk.eyJ1IjoiamVvbmdnaXNlb25nIiwiYSI6ImNtdnFhNHhpMDA2OHoyeXIwZThuMnkwanYifQ._Zouj-a9d2NaLWCVyRKwiQ';
+    final url = Uri.parse(
+      'https://api.mapbox.com/geocoding/v5/mapbox.places/${point.longitude},${point.latitude}.json'
+      '?types=address,poi,neighborhood,locality,place&limit=1&access_token=$token',
+    );
+    try {
+      final res = await http.get(url).timeout(const Duration(seconds: 4));
+      if (res.statusCode == 200) {
+        final data = jsonDecode(res.body);
+        final features = data['features'] as List?;
+        if (features != null && features.isNotEmpty) {
+          final f = features.first;
+          final placeText = (f['text'] ?? '').toString();
+          String contextStr = '';
+          final ctxList = f['context'] as List?;
+          if (ctxList != null && ctxList.isNotEmpty) {
+            contextStr = (ctxList.first['text'] ?? '').toString();
+          }
+          final fullAddr = contextStr.isNotEmpty && contextStr != placeText
+              ? '$contextStr $placeText'
+              : (f['place_name'] ?? placeText).toString().split(',').take(2).join(' ');
+          if (fullAddr.trim().isNotEmpty) {
+            _roadAddressCache[key] = fullAddr.trim();
+            _lastGeocodedCoordByKey[lang] = point;
+            _lastGeocodedTimeByKey[lang] = DateTime.now();
+            return fullAddr.trim();
+          }
+        }
+      }
+    } catch (_) {}
+    return '${point.latitude.toStringAsFixed(4)}, ${point.longitude.toStringAsFixed(4)}';
+  }
+
+  Future<List<LatLng>> fetchRoadSnappedRoute(
+    dynamic firstPointOrList, [
+    LatLng? secondPoint,
+    String? profileOpt,
+  ]) async {
+    return _computeSmoothedRoute(firstPointOrList, secondPoint);
+  }
+
+  List<LatLng> _computeSmoothedRoute(dynamic firstPointOrList, [LatLng? secondPoint]) {
+    List<LatLng> waypoints = [];
+    if (firstPointOrList is List<LatLng>) {
+      waypoints = firstPointOrList;
+    } else if (firstPointOrList is LatLng && secondPoint != null) {
+      waypoints = [firstPointOrList, secondPoint];
+    }
+    if (waypoints.length < 2) return waypoints;
+
+    final List<LatLng> smoothed = [];
+    for (int i = 0; i < waypoints.length - 1; i++) {
+      final p0 = waypoints[i];
+      final p1 = waypoints[i + 1];
+      smoothed.add(p0);
+      smoothed.add(LatLng(
+        p0.latitude * 0.67 + p1.latitude * 0.33,
+        p0.longitude * 0.67 + p1.longitude * 0.33,
+      ));
+      smoothed.add(LatLng(
+        p0.latitude * 0.33 + p1.latitude * 0.67,
+        p0.longitude * 0.33 + p1.longitude * 0.67,
+      ));
+    }
+    smoothed.add(waypoints.last);
+    return smoothed;
+  }
+
+  Future<void> pushLiveLocationToServer({
+    required String circleCode,
+    required String userName,
+    LatLng? point,
+    LatLng? position,
+    double speedKmh = 0.0,
+    int? battery,
+    int? batteryLevel,
+    bool isSos = false,
+    String? avatarUrl,
+    String? audioClipDataUrl,
+    String? signalClip,
+    List<CircleInfo>? allJoinedCircles,
+    bool forceImmediate = false,
+  }) async {
+    if (!isSupabaseReady) return;
+    final targetPos = point ?? position ?? const LatLng(37.5665, 126.9780);
+    final targetBat = battery ?? batteryLevel ?? 90;
+    final rawClip = audioClipDataUrl ?? signalClip ?? '';
+
+    if (avatarUrl != null && avatarUrl.isNotEmpty) {
+      myCustomAvatarDataUrl = avatarUrl;
+    }
+
+    final hasUrgentSignal = isSos ||
+        forceImmediate ||
+        (rawClip.isNotEmpty && !rawClip.startsWith('BUBBLE::'));
+
+    final now = DateTime.now();
+    if (!hasUrgentSignal && _lastServerPushTime != null && _lastServerPushLatLng != null) {
+      final elapsedSec = now.difference(_lastServerPushTime!).inSeconds;
+      final movedMeters = calculateDistanceMeters(_lastServerPushLatLng!, targetPos);
+      if (elapsedSec < 15 && movedMeters < 20.0) {
+        return;
+      }
+    }
+
+    _lastServerPushTime = now;
+    _lastServerPushLatLng = targetPos;
+
+    if (rawClip.isNotEmpty) {
+      activeSignalEnvelope = rawClip;
+      activeSignalExpiresAt = now.add(const Duration(seconds: 30));
+    } else if (activeSignalExpiresAt != null && now.isAfter(activeSignalExpiresAt!)) {
+      activeSignalEnvelope = '';
+      activeSignalExpiresAt = null;
+    }
+
+    final effectiveClip = rawClip.isNotEmpty
+        ? rawClip
+        : (activeSignalEnvelope.isNotEmpty
+            ? activeSignalEnvelope
+            : (isBubblePrivacyActive
+                ? 'BUBBLE::ON::${myPhoneNumber.trim()}'
+                : (myPhoneNumber.trim().isNotEmpty ? 'META::PHONE::${myPhoneNumber.trim()}' : '')));
+
+    double sendLat = targetPos.latitude;
+    double sendLng = targetPos.longitude;
+    if (isBubblePrivacyActive && !isSos) {
+      sendLat = double.parse(targetPos.latitude.toStringAsFixed(2));
+      sendLng = double.parse(targetPos.longitude.toStringAsFixed(2));
+    }
+
+    final payload = <String, dynamic>{
+      'user_id': currentUserId,
+      'circle_code': circleCode,
+      'user_name': userName,
+      'lat': sendLat,
+      'lng': sendLng,
+      'speed_kmh': speedKmh,
+      'battery_level': targetBat,
+      'is_sos': isSos,
+      'audio_clip': effectiveClip,
+      'updated_at': now.toIso8601String(),
+    };
+    if (myCustomAvatarDataUrl.isNotEmpty) {
+      payload['avatar_url'] = myCustomAvatarDataUrl;
+    }
+
+    try {
+      await Supabase.instance.client.from('locations').upsert(payload);
+    } catch (_) {}
+  }
+
+  Future<void> deleteMyServerDataAndReset() async {
+    await deleteUserAccountAndData();
+  }
+
+  Future<void> deleteUserAccountAndData([List<CircleInfo>? joinedCircles]) async {
+    if (!isSupabaseReady) return;
+    try {
+      if (currentUserId.isNotEmpty) {
+        await Supabase.instance.client.from('locations').delete().eq('user_id', currentUserId);
+      }
+      final sessionFile = File('${Directory.systemTemp.path}/pingo_saved_session_v1.json');
+      if (await sessionFile.exists()) await sessionFile.delete();
+    } catch (_) {}
+  }
+
+  File get _localSessionFile => File('${Directory.systemTemp.path}/pingo_saved_session_v1.json');
+
+  Future<void> saveLocalCirclesState({
+    required List<CircleInfo> circles,
+    required int activeIndex,
+    required String userName,
+    List<SafePlaceData>? safePlaces,
+    List<LatLng>? myRecentRoute,
+  }) async {
+    try {
+      final data = {
+        'userName': userName,
+        'myPhoneNumber': myPhoneNumber,
+        'activeIndex': activeIndex,
+        'avatarDataUrl': myCustomAvatarDataUrl,
+        'isBubblePrivacyActive': isBubblePrivacyActive,
+        'isProUser': isProUser,
+        'isAlertMuted': isAlertMuted,
+        'showDemoWhenAlone': showDemoWhenAlone,
+        'mapStyleIndex': mapStyleIndex,
+        'memberPhones': memberPhones,
+        'blockedUserIds': blockedUserIds.toList(),
+        'circleHiddenMap': circleHiddenMap,
+        'circles': circles
+            .map((c) => {
+                  'name': c.name,
+                  'code': c.code,
+                  'myRole': c.myRole,
+                })
+            .toList(),
+      };
+      await _localSessionFile.writeAsString(jsonEncode(data), flush: true);
+    } catch (_) {}
+  }
+
+  Future<Map<String, dynamic>?> loadLocalCirclesState() async {
+    try {
+      if (!await _localSessionFile.exists()) return null;
+      final raw = await _localSessionFile.readAsString();
+      final decoded = jsonDecode(raw) as Map<String, dynamic>;
+      if (decoded['avatarDataUrl'] != null) {
+        myCustomAvatarDataUrl = decoded['avatarDataUrl'].toString();
+      }
+      if (decoded['myPhoneNumber'] != null) {
+        myPhoneNumber = decoded['myPhoneNumber'].toString();
+      }
+      if (decoded['isBubblePrivacyActive'] is bool) {
+        isBubblePrivacyActive = decoded['isBubblePrivacyActive'] as bool;
+      }
+      if (decoded['isProUser'] is bool) {
+        isProUser = decoded['isProUser'] as bool;
+      }
+      if (decoded['memberPhones'] is Map) {
+        final mp = decoded['memberPhones'] as Map;
+        mp.forEach((k, v) {
+          if (v != null) memberPhones[k.toString()] = v.toString();
+        });
+      }
+      return decoded;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  void dispose() {
+    _iapSubscription?.cancel();
+  }
+}
