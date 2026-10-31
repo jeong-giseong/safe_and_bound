@@ -437,7 +437,7 @@ class AppEngineService {
     const token = 'pk.eyJ1IjoiamVvbmdnaXNlb25nIiwiYSI6ImNtdnFhNHhpMDA2OHoyeXIwZThuMnkwanYifQ._Zouj-a9d2NaLWCVyRKwiQ';
     final url = Uri.parse(
       'https://api.mapbox.com/geocoding/v5/mapbox.places/${point.longitude},${point.latitude}.json'
-      '?types=address,poi,neighborhood,locality,place&limit=1&access_token=$token',
+      '?types=address,poi,neighborhood,locality,place&language=ko&limit=1&access_token=$token',
     );
     try {
       final res = await http.get(url).timeout(const Duration(seconds: 4));

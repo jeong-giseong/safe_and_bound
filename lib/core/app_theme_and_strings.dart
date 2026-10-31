@@ -1118,8 +1118,68 @@ class AppStrings {
     },
   };
 
+      static const Map<String, String> _koMasterOverride = {
+    'my_timeline_btn': '내 이동 타임라인 보기',
+    'bubble_mode_title': '버블 프라이버시 모드 (반경 600m 보호)',
+    'bubble_mode_on_desc': '현재 내 상세 위치가 보호되어 서클 멤버에게 반경 600m 대략적 구역만 표시됩니다.',
+    'bubble_mode_off_desc': '현재 정확한 실시간 위치가 서클 멤버에게 공유되고 있습니다.',
+    'route_point_unit': '개 지점',
+    'route_points_unit': '개 지점',
+    'role_owner': '서클장',
+    'role_member': '멤버',
+    'sos_Active_banner': '🚨 SOS 위급 신호 발령 중! 즉시 위치를 확인하세요!',
+    'sos_active_banner': '🚨 SOS 위급 신호 발령 중! 즉시 위치를 확인하세요!',
+    'q_where': '👋 지금 어딨어?',
+    'q_otw': '🏃 지금 가는 중!',
+    'q_home': '🏠 집 도착했어',
+    'q_call': '📞 전화 좀 해줘',
+    'q_meal': '🍚 밥 챙겨 먹었어?',
+    'q_coffee': '☕ 커피 한잔할래?',
+    'q_lowbat': '🪫 배터리 얼마 없어',
+    'q_love': '❤️ 사랑해!',
+    'where': '👋 지금 어딨어?',
+    'otw': '🏃 지금 가는 중!',
+    'qhome': '🏠 집 도착했어',
+    'qcall': '📞 전화 좀 해줘',
+    'qmeal': '🍚 밥 챙겨 먹었어?',
+    'qcoffee': '☕ 커피 한잔할래?',
+    'qlowbat': '🪫 배터리 얼마 없어',
+    'qlove': '❤️ 사랑해!',
+    'reply_otw': '🏃 가는 중이라고 답장',
+    'phone_input_title': '전화번호 등록 및 연결',
+    'phone_input_hint': '전화번호 입력 (예: 010-1234-5678)',
+    'phone_save_call': '번호 저장 후 바로 연결하기',
+    'call_btn': '전화 걸기',
+    'sms_btn': '문자 보내기',
+    'directions_btn': '길찾기',
+    'navigate_btn': '길찾기',
+    'share_sms_btn': '문자로 초대장 보내기',
+    'just_now': '방금 전',
+    'syncing_address': '도로명 주소 확인 중...',
+    'demo_member_1': '민준 (체험 파트너)',
+    'demo_member_2': '서연 (체험 파트너)',
+    'demo_nav_unsupported': '🧪 체험용 데모 파트너는 실제 내비게이션 길찾기를 지원하지 않습니다.',
+    'dest_home': '🏠 안심 귀가 목적지',
+    'web_live_badge': '실시간 귀갓길 보호 작동 중',
+    'web_arrived_msg': '님이 목적지에 안전하게 도착했습니다!',
+    'web_remaining_dist': '이동 거리',
+    'web_last_will_alert': '배터리 잔량이 극소량(2%)입니다! 마지막 위치가 고정 보존됩니다.',
+    'web_test_low_bat': '배터리 2% 마지막 위치 고정 테스트',
+    'web_ping_cheer': '응원 하트 보내기',
+    'web_cheer_sent': '님에게 안심 귀가 응원 신호를 보냈습니다!',
+    'avatar_picker_title': '프로필 아바타 또는 사진 선택',
+    'pick_photo_gallery': '앨범에서 선택',
+    'pick_photo_camera': '카메라 촬영',
+    'safe_zone_in': '안심 구역 내',
+    'Filter_Moving': '이동 중',
+  };
+
   static String t(String key) {
-    return _dict[lang]?[key] ?? _dict['en']![key] ?? key;
+    if (lang == 'ko' && _koMasterOverride.containsKey(key)) {
+      return _koMasterOverride[key]!;
+    }
+    final langMap = _dict[lang] ?? _dict['ko'] ?? _dict['en']!;
+    return langMap[key] ?? _koMasterOverride[key] ?? _dict['ko']?[key] ?? _dict['en']?[key] ?? key;
   }
 }
 

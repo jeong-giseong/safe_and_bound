@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_map/flutter_map.dart';
+import 'package:geolocator/geolocator.dart';
 import 'package:latlong2/latlong.dart' hide Path;
 
 import '../core/app_theme_and_strings.dart';
@@ -30,18 +31,18 @@ class SafeReturnLiveWebScreen extends StatefulWidget {
 class _SafeReturnLiveWebScreenState extends State<SafeReturnLiveWebScreen> {
   final MapController _webMapController = MapController();
   Timer? _countdownTimer;
-  Timer? _walkTimer;
+  StreamSubscription<Position>? _realGpsSub;
 
   int _remainingSeconds = 1800;
-  int _currentStep = 0;
   late int _batteryLevel;
   bool _isLastWillPinned = false;
   bool _isArrived = false;
   late String _currentRoadAddress;
 
-  List<LatLng> _homewardRoute = [];
+  List<LatLng> _walkedBreadcrumbs = [];
   late LatLng _currentPos;
-  late LatLng _destPos;
+  late LatLng _startOriginPos;
+  double _currentSpeedKmh = 0.0;
 
   @override
   void initState() {
@@ -49,13 +50,10 @@ class _SafeReturnLiveWebScreenState extends State<SafeReturnLiveWebScreen> {
     _currentRoadAddress = AppStrings.t('syncing_address');
     _batteryLevel = widget.initialBattery;
     _currentPos = widget.startLocation;
-    _destPos = LatLng(
-      widget.startLocation.latitude + 0.0052,
-      widget.startLocation.longitude + 0.0040,
-    );
-    _homewardRoute = [_currentPos, _destPos];
+    _startOriginPos = widget.startLocation;
+    _walkedBreadcrumbs = [_currentPos];
 
-    _initRealRoadRouteAndAddress();
+    _initRealRoadAddressAndLiveGps();
 
     _countdownTimer = Timer.periodic(const Duration(seconds: 1), (t) {
       if (!mounted) return;
@@ -65,38 +63,56 @@ class _SafeReturnLiveWebScreenState extends State<SafeReturnLiveWebScreen> {
     });
   }
 
-  Future<void> _initRealRoadRouteAndAddress() async {
-    final roadPoints = await AppEngineService.instance.fetchRoadSnappedRoute(
+  Future<void> _initRealRoadAddressAndLiveGps() async {
+    final addr = await AppEngineService.instance.fetchRoadAddress(
       _currentPos,
-      _destPos,
-      
+      forceLookup: true,
     );
-    final addr = await AppEngineService.instance.fetchRoadAddress(_currentPos);
+    if (mounted) {
+      setState(() => _currentRoadAddress = addr);
+    }
 
-    if (!mounted) return;
-    setState(() {
-      _homewardRoute = roadPoints;
-      _currentRoadAddress = addr;
-    });
+    try {
+      _realGpsSub = Geolocator.getPositionStream(
+        locationSettings: const LocationSettings(
+          accuracy: LocationAccuracy.high,
+          distanceFilter: 5,
+        ),
+      ).listen((Position pos) async {
+        if (!mounted || _isArrived || _isLastWillPinned) return;
+        if (pos.accuracy > 65.0) return;
 
-    _walkTimer = Timer.periodic(const Duration(milliseconds: 900), (t) {
-      if (!mounted || _isLastWillPinned || _isArrived) return;
-      if (_currentStep < _homewardRoute.length - 1) {
+        final nextPt = LatLng(pos.latitude, pos.longitude);
+        final moved = AppEngineService.instance.calculateDistanceMeters(
+          _currentPos,
+          nextPt,
+        );
+        final spd = (pos.speed * 3.6).clamp(0.0, 180.0);
+
         setState(() {
-          _currentStep++;
-          _currentPos = _homewardRoute[_currentStep];
+          _currentPos = nextPt;
+          _currentSpeedKmh = spd;
+          if (moved >= 4.0) {
+            _walkedBreadcrumbs.add(nextPt);
+          }
         });
-      } else {
-        setState(() => _isArrived = true);
-        t.cancel();
-      }
-    });
+
+        _webMapController.move(nextPt, _webMapController.camera.zoom);
+        final updatedAddr = await AppEngineService.instance.fetchRoadAddress(
+          nextPt,
+          speedKmh: spd,
+        );
+        if (mounted) {
+          setState(() => _currentRoadAddress = updatedAddr);
+        }
+      });
+    } catch (_) {}
   }
 
   @override
   void dispose() {
     _countdownTimer?.cancel();
-    _walkTimer?.cancel();
+    _realGpsSub?.cancel();
     super.dispose();
   }
 
@@ -116,9 +132,13 @@ class _SafeReturnLiveWebScreenState extends State<SafeReturnLiveWebScreen> {
 
   @override
   Widget build(BuildContext context) {
-    final remainingMeters = AppEngineService.instance
-        .calculateDistanceMeters(_currentPos, _destPos)
-        .round();
+    double movedMeters = 0;
+    for (int i = 1; i < _walkedBreadcrumbs.length; i++) {
+      movedMeters += AppEngineService.instance.calculateDistanceMeters(
+        _walkedBreadcrumbs[i - 1],
+        _walkedBreadcrumbs[i],
+      );
+    }
 
     return Scaffold(
       backgroundColor: AppColors.cardWhite,
@@ -136,9 +156,9 @@ class _SafeReturnLiveWebScreenState extends State<SafeReturnLiveWebScreen> {
             const SizedBox(width: 6),
             Expanded(
               child: Text(
-                'pingo.pages.dev/live/${widget.shareToken}',
+                'jeong-giseong.github.io/pingo-live.html?circle=${widget.shareToken}',
                 style: const TextStyle(
-                  fontSize: 13,
+                  fontSize: 12.5,
                   fontFamily: 'monospace',
                   color: Colors.white70,
                 ),
@@ -152,7 +172,7 @@ class _SafeReturnLiveWebScreenState extends State<SafeReturnLiveWebScreen> {
             margin: const EdgeInsets.symmetric(vertical: 10, horizontal: 12),
             padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
             decoration: BoxDecoration(
-              color: Colors.redAccent,
+              color: _isArrived ? AppColors.safeGreenText : Colors.redAccent,
               borderRadius: BorderRadius.circular(20),
             ),
             child: Row(
@@ -164,7 +184,7 @@ class _SafeReturnLiveWebScreenState extends State<SafeReturnLiveWebScreen> {
                 ),
                 const SizedBox(width: 4),
                 Text(
-                  _formatCountdown(_remainingSeconds),
+                  _isArrived ? '귀가 완료' : _formatCountdown(_remainingSeconds),
                   style: const TextStyle(
                     fontSize: 12,
                     fontWeight: FontWeight.bold,
@@ -180,7 +200,7 @@ class _SafeReturnLiveWebScreenState extends State<SafeReturnLiveWebScreen> {
         children: [
           FlutterMap(
             mapController: _webMapController,
-            options: MapOptions(initialCenter: _currentPos, initialZoom: 15.3),
+            options: MapOptions(initialCenter: _currentPos, initialZoom: 16.0),
             children: [
               TileLayer(
                 urlTemplate: AppConfig.buildLocalizedMapTileUrl(0),
@@ -189,8 +209,8 @@ class _SafeReturnLiveWebScreenState extends State<SafeReturnLiveWebScreen> {
               CircleLayer(
                 circles: [
                   CircleMarker(
-                    point: _destPos,
-                    radius: 140,
+                    point: _currentPos,
+                    radius: 45,
                     useRadiusInMeter: true,
                     color: AppColors.geofenceFill,
                     borderColor: AppColors.primaryPurple,
@@ -198,55 +218,41 @@ class _SafeReturnLiveWebScreenState extends State<SafeReturnLiveWebScreen> {
                   ),
                 ],
               ),
-              PolylineLayer(
-                polylines: [
-                  Polyline(
-                    points: _homewardRoute,
-                    color: AppColors.primaryPurple.withValues(alpha: 0.28),
-                    strokeWidth: 6.0,
-                  ),
-                  Polyline(
-                    points: _homewardRoute.sublist(
-                      0,
-                      (_currentStep + 1).clamp(1, _homewardRoute.length),
+              if (_walkedBreadcrumbs.length >= 2)
+                PolylineLayer(
+                  polylines: [
+                    Polyline(
+                      points: _walkedBreadcrumbs,
+                      color: Colors.white,
+                      strokeWidth: 9.0,
                     ),
-                    color: Colors.white,
-                    strokeWidth: 9.0,
-                  ),
-                  Polyline(
-                    points: _homewardRoute.sublist(
-                      0,
-                      (_currentStep + 1).clamp(1, _homewardRoute.length),
+                    Polyline(
+                      points: _walkedBreadcrumbs,
+                      color: _isLastWillPinned
+                          ? Colors.redAccent
+                          : AppColors.primaryPurple,
+                      strokeWidth: 5.5,
                     ),
-                    color: _isLastWillPinned
-                        ? Colors.redAccent
-                        : AppColors.primaryPurple,
-                    strokeWidth: 5.5,
-                  ),
-                ],
-              ),
+                  ],
+                ),
               MarkerLayer(
                 markers: [
                   Marker(
-                    point: _destPos,
-                    width: 120,
-                    height: 36,
+                    point: _startOriginPos,
+                    width: 90,
+                    height: 32,
                     child: Container(
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 8,
-                        vertical: 4,
-                      ),
+                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
                       decoration: BoxDecoration(
-                        color: AppColors.primaryPurple,
-                        borderRadius: BorderRadius.circular(14),
+                        color: AppColors.textDark.withValues(alpha: 0.8),
+                        borderRadius: BorderRadius.circular(12),
                       ),
-                      child: Center(
+                      child: const Center(
                         child: Text(
-                          AppStrings.t('dest_home'),
-                          overflow: TextOverflow.ellipsis,
-                          style: const TextStyle(
+                          '🚩 출발 위치',
+                          style: TextStyle(
                             color: Colors.white,
-                            fontSize: 11,
+                            fontSize: 10.5,
                             fontWeight: FontWeight.bold,
                           ),
                         ),
@@ -255,7 +261,7 @@ class _SafeReturnLiveWebScreenState extends State<SafeReturnLiveWebScreen> {
                   ),
                   Marker(
                     point: _currentPos,
-                    width: 125,
+                    width: 130,
                     height: 98,
                     child: Column(
                       mainAxisSize: MainAxisSize.min,
@@ -276,8 +282,8 @@ class _SafeReturnLiveWebScreenState extends State<SafeReturnLiveWebScreen> {
                           ),
                           child: Text(
                             _isLastWillPinned
-                                ? '🪫 $_batteryLevel% (${AppStrings.t('last_will_pin')})'
-                                : '⚡ $_batteryLevel%',
+                                ? '🪫 $_batteryLevel% (마지막 위치 고정)'
+                                : '⚡ $_batteryLevel% • ${_currentSpeedKmh.toStringAsFixed(0)}km/h',
                             style: TextStyle(
                               fontSize: 10.5,
                               fontWeight: FontWeight.bold,
@@ -367,17 +373,17 @@ class _SafeReturnLiveWebScreenState extends State<SafeReturnLiveWebScreen> {
                           children: [
                             Text(
                               _isArrived
-                                  ? '🎉 ${widget.sharerName} ${AppStrings.t('web_arrived_msg')}'
-                                  : '${widget.sharerName} • ${AppStrings.t('web_live_badge')}',
+                                  ? '🎉 ${widget.sharerName}님이 안전하게 귀가 완료했습니다!'
+                                  : '${widget.sharerName} • 실시간 귀갓길 위치 공유 중',
                               style: const TextStyle(
                                 fontWeight: FontWeight.bold,
-                                fontSize: 15,
+                                fontSize: 14.5,
                                 color: AppColors.textDark,
                               ),
                             ),
-                            const SizedBox(height: 2),
+                            const SizedBox(height: 3),
                             Text(
-                              '📍 $_currentRoadAddress • ${AppStrings.t('web_remaining_dist')} ${remainingMeters}m',
+                              '📍 현재 위치: $_currentRoadAddress (실시간 이동 ${movedMeters.round()}m)',
                               style: const TextStyle(
                                 fontSize: 12,
                                 color: AppColors.textGray,
@@ -459,10 +465,10 @@ class _SafeReturnLiveWebScreenState extends State<SafeReturnLiveWebScreen> {
                             Icons.battery_0_bar_rounded,
                             size: 18,
                           ),
-                          label: Text(
-                            AppStrings.t('web_test_low_bat'),
-                            style: const TextStyle(
-                              fontSize: 12,
+                          label: const Text(
+                            '배터리 2% 핀 고정 테스트',
+                            style: TextStyle(
+                              fontSize: 11.5,
                               fontWeight: FontWeight.bold,
                             ),
                           ),
@@ -472,7 +478,9 @@ class _SafeReturnLiveWebScreenState extends State<SafeReturnLiveWebScreen> {
                       Expanded(
                         child: ElevatedButton.icon(
                           style: ElevatedButton.styleFrom(
-                            backgroundColor: AppColors.primaryPurple,
+                            backgroundColor: _isArrived
+                                ? AppColors.safeGreenText
+                                : AppColors.primaryPurple,
                             foregroundColor: Colors.white,
                             padding: const EdgeInsets.symmetric(vertical: 12),
                             shape: RoundedRectangleBorder(
@@ -480,19 +488,18 @@ class _SafeReturnLiveWebScreenState extends State<SafeReturnLiveWebScreen> {
                             ),
                           ),
                           onPressed: () {
-                            HapticFeedback.lightImpact();
+                            HapticFeedback.mediumImpact();
+                            setState(() => _isArrived = true);
                             ScaffoldMessenger.of(context).showSnackBar(
-                              SnackBar(
-                                backgroundColor: AppColors.primaryPurple,
-                                content: Text(
-                                  '❤️ ${widget.sharerName} ${AppStrings.t('web_cheer_sent')}',
-                                ),
+                              const SnackBar(
+                                backgroundColor: AppColors.safeGreenText,
+                                content: Text('✅ 안전 귀가 완료 상태가 가족에게 공유되었습니다.'),
                               ),
                             );
                           },
-                          icon: const Icon(Icons.favorite_rounded, size: 16),
+                          icon: const Icon(Icons.home_rounded, size: 17),
                           label: Text(
-                            AppStrings.t('web_ping_cheer'),
+                            _isArrived ? '귀가 완료됨' : '안전 귀가 완료 알림',
                             style: const TextStyle(
                               fontSize: 12,
                               fontWeight: FontWeight.bold,
@@ -511,4 +518,3 @@ class _SafeReturnLiveWebScreenState extends State<SafeReturnLiveWebScreen> {
     );
   }
 }
-
