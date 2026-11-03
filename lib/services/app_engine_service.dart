@@ -1,3 +1,4 @@
+import 'dart:core';
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
@@ -43,6 +44,11 @@ class AppEngineService {
   final Map<String, bool> circleHiddenMap = {};
   final Set<String> blockedUserIds = {};
 
+  final Map<String, List<LatLng>> myDailyRoutes = {};
+  final Map<String, double> myDailyMaxSpeed = {};
+  final Map<String, Map<String, List<LatLng>>> memberDailyRoutes = {};
+  final Map<String, double> memberMaxSpeedMap = {};
+
   Map<String, String> get memberPhoneBook => memberPhones;
 
   DateTime? _lastServerPushTime;
@@ -50,18 +56,18 @@ class AppEngineService {
   StreamSubscription<List<PurchaseDetails>>? _iapSubscription;
 
   static const List<String> presetEmojiAvatars = [
-    'avatar:😊',
-    'avatar:😎',
-    'avatar:🦊',
-    'avatar:🐱',
     'avatar:🐶',
-    'avatar:🐼',
+    'avatar:🐱',
     'avatar:🐰',
+    'avatar:🦊',
+    'avatar:🐻',
+    'avatar:🐼',
     'avatar:🦁',
-    'avatar:🐸',
+    'avatar:🐯',
+    'avatar:🐨',
+    'avatar:🐹',
     'avatar:🦄',
-    'avatar:👑',
-    'avatar:🚀',
+    'avatar:🐧',
   ];
 
   String get currentMapboxStyleId {
@@ -70,10 +76,78 @@ class AppEngineService {
     return AppConfig.mapboxStyleId;
   }
 
+  static String dateKeyOf(DateTime dt) {
+    final y = dt.year.toString().padLeft(4, '0');
+    final m = dt.month.toString().padLeft(2, '0');
+    final d = dt.day.toString().padLeft(2, '0');
+    return '$y-$m-$d';
+  }
+
+  static String get todayKey => dateKeyOf(DateTime.now());
+  static String get yesterdayKey =>
+      dateKeyOf(DateTime.now().subtract(const Duration(days: 1)));
+
+  Directory _resolvePersistentDirectory() {
+    try {
+      final tempDir = Directory.systemTemp;
+      final parentDir = tempDir.parent;
+      if (Platform.isIOS) {
+        final docs = Directory('${parentDir.path}/Documents');
+        if (docs.existsSync()) return docs;
+      } else if (Platform.isAndroid) {
+        final filesDir = Directory('${parentDir.path}/files');
+        if (filesDir.existsSync()) return filesDir;
+        try {
+          filesDir.createSync(recursive: true);
+          return filesDir;
+        } catch (_) {}
+      }
+      return tempDir;
+    } catch (_) {
+      return Directory.systemTemp;
+    }
+  }
+
+  File _storageFile(String name) {
+    final dir = _resolvePersistentDirectory();
+    return File('${dir.path}/$name');
+  }
+
+  File _fallbackTempFile(String name) {
+    return File('${Directory.systemTemp.path}/$name');
+  }
+
+  Future<String> _readPersistentText(String fileName) async {
+    try {
+      final f1 = _storageFile(fileName);
+      if (await f1.exists()) return await f1.readAsString();
+      final f2 = _fallbackTempFile(fileName);
+      if (await f2.exists()) return await f2.readAsString();
+    } catch (_) {}
+    return '';
+  }
+
+  Future<void> _writePersistentText(String fileName, String content) async {
+    try {
+      await _storageFile(fileName).writeAsString(content, flush: true);
+    } catch (_) {}
+    try {
+      await _fallbackTempFile(fileName).writeAsString(content, flush: true);
+    } catch (_) {}
+  }
+
   String buildCircleScopedUserId(String circleCode) {
-    final base = currentUserId.isEmpty ? '00000000-0000-4000-8000-000000000000' : currentUserId;
-    final cleanCode = circleCode.replaceAll(RegExp(r'[^0-9A-Za-z]'), '').toLowerCase().padRight(6, '0');
-    final hexSuffix = cleanCode.codeUnits.take(6).map((c) => (c % 16).toRadixString(16)).join();
+    final base = currentUserId.isEmpty
+        ? '00000000-0000-4000-8000-000000000000'
+        : currentUserId;
+    final cleanCode = circleCode
+        .replaceAll(RegExp(r'[^0-9A-Za-z]'), '')
+        .toLowerCase()
+        .padRight(6, '0');
+    final hexSuffix = cleanCode.codeUnits
+        .take(6)
+        .map((c) => (c % 16).toRadixString(16))
+        .join();
     if (base.length >= 36 && base.contains('-')) {
       return '${base.substring(0, 30)}$hexSuffix';
     }
@@ -86,6 +160,7 @@ class AppEngineService {
 
   Future<void> ensureAnonymousSession() async {
     await _loadOrGeneratePersistentDeviceId();
+    await _loadPersistentTimelineHistory();
     try {
       await Supabase.initialize(
         url: AppConfig.supabaseUrl,
@@ -102,25 +177,338 @@ class AppEngineService {
     await _loadOrGeneratePersistentDeviceId();
   }
 
+  String _generateRandomUuidV4() {
+    final rnd = math.Random();
+    String hex(int len) =>
+        List.generate(len, (_) => rnd.nextInt(16).toRadixString(16)).join();
+    return '${hex(8)}-${hex(4)}-4${hex(3)}-8${hex(3)}-${hex(12)}';
+  }
+
   Future<void> _loadOrGeneratePersistentDeviceId() async {
     try {
-      final file = File('${Directory.systemTemp.path}/pingo_device_identity_v2.txt');
-      if (await file.exists()) {
-        final saved = (await file.readAsString()).trim();
-        if (saved.length >= 32) {
-          currentUserId = saved;
-          return;
-        }
+      final raw = await _readPersistentText('pingo_device_identity_v3.txt');
+      if (raw.trim().length >= 32) {
+        currentUserId = raw.trim();
+        return;
       }
-      final rnd = math.Random.secure();
-      String hex(int len) => List.generate(len, (_) => rnd.nextInt(16).toRadixString(16)).join();
-      currentUserId = '${hex(8)}-${hex(4)}-4${hex(3)}-8${hex(3)}-${hex(12)}';
-      await file.writeAsString(currentUserId, flush: true);
+      final oldRaw = await _readPersistentText('pingo_device_identity_v2.txt');
+      if (oldRaw.trim().length >= 32) {
+        currentUserId = oldRaw.trim();
+        await _writePersistentText(
+          'pingo_device_identity_v3.txt',
+          currentUserId,
+        );
+        return;
+      }
+      currentUserId = _generateRandomUuidV4();
+      await _writePersistentText('pingo_device_identity_v3.txt', currentUserId);
     } catch (_) {
-      final rnd = math.Random();
-      String hex(int len) => List.generate(len, (_) => rnd.nextInt(16).toRadixString(16)).join();
-      currentUserId = '${hex(8)}-${hex(4)}-4${hex(3)}-8${hex(3)}-${hex(12)}';
+      if (currentUserId.isEmpty) {
+        currentUserId = _generateRandomUuidV4();
+      }
     }
+  }
+
+  Future<void> _loadPersistentTimelineHistory() async {
+    try {
+      final rawJson =
+          await _readPersistentText('pingo_timeline_history_v3.json');
+      if (rawJson.isNotEmpty) {
+        final decoded = jsonDecode(rawJson) as Map<String, dynamic>;
+        final cutoff = DateTime.now().subtract(const Duration(days: 31));
+        decoded.forEach((dKey, listVal) {
+          final parsedDate = DateTime.tryParse(dKey);
+          if (parsedDate != null &&
+              parsedDate.isAfter(cutoff) &&
+              listVal is List) {
+            final pts = <LatLng>[];
+            for (final item in listVal) {
+              if (item is List && item.length >= 2) {
+                pts.add(
+                  LatLng(
+                    (item[0] as num).toDouble(),
+                    (item[1] as num).toDouble(),
+                  ),
+                );
+              }
+            }
+            if (pts.isNotEmpty) {
+              myDailyRoutes[dKey] = pts;
+            }
+          }
+        });
+      }
+      final rawSpd =
+          await _readPersistentText('pingo_timeline_maxspeed_v3.json');
+      if (rawSpd.isNotEmpty) {
+        final decodedSpd = jsonDecode(rawSpd) as Map<String, dynamic>;
+        decodedSpd.forEach((k, v) {
+          if (v is num) myDailyMaxSpeed[k] = v.toDouble();
+        });
+      }
+      final rawRemote =
+          await _readPersistentText('pingo_remote_timelines_v3.json');
+      if (rawRemote.isNotEmpty) {
+        final decodedRem = jsonDecode(rawRemote) as Map<String, dynamic>;
+        decodedRem.forEach((uid, dayMap) {
+          if (dayMap is Map) {
+            memberDailyRoutes[uid] = {};
+            dayMap.forEach((dKey, listVal) {
+              if (listVal is List) {
+                final pts = <LatLng>[];
+                for (final item in listVal) {
+                  if (item is List && item.length >= 2) {
+                    pts.add(
+                      LatLng(
+                        (item[0] as num).toDouble(),
+                        (item[1] as num).toDouble(),
+                      ),
+                    );
+                  }
+                }
+                if (pts.isNotEmpty) {
+                  memberDailyRoutes[uid]![dKey.toString()] = pts;
+                }
+              }
+            });
+          }
+        });
+      }
+    } catch (_) {}
+  }
+
+  Future<List<LatLng>> recordMyLocationBreadcrumb(
+    LatLng point, {
+    double speedKmh = 0.0,
+  }) async {
+    final tKey = todayKey;
+    final list = myDailyRoutes.putIfAbsent(tKey, () => <LatLng>[]);
+    if (list.isEmpty) {
+      list.add(point);
+    } else {
+      final dist = calculateDistanceMeters(list.last, point);
+      if (dist >= 12.0) {
+        list.add(point);
+        if (list.length > 250) list.removeAt(0);
+      }
+    }
+    final prevMax = myDailyMaxSpeed[tKey] ?? 0.0;
+    if (speedKmh > prevMax) {
+      myDailyMaxSpeed[tKey] = speedKmh;
+    }
+    try {
+      final serialized = <String, dynamic>{};
+      myDailyRoutes.forEach((k, v) {
+        serialized[k] = v
+            .map(
+              (p) => [
+                double.parse(p.latitude.toStringAsFixed(5)),
+                double.parse(p.longitude.toStringAsFixed(5)),
+              ],
+            )
+            .toList();
+      });
+      await _writePersistentText(
+        'pingo_timeline_history_v3.json',
+        jsonEncode(serialized),
+      );
+      await _writePersistentText(
+        'pingo_timeline_maxspeed_v3.json',
+        jsonEncode(myDailyMaxSpeed),
+      );
+    } catch (_) {}
+    return List<LatLng>.from(list);
+  }
+
+  List<LatLng> getRouteForMemberTab(
+    String memberId,
+    int tabIndex,
+    LatLng fallbackLoc,
+  ) {
+    final isMe = memberId == 'm1' || memberId == currentUserId;
+    if (isMe) {
+      if (tabIndex == 0) {
+        final r = myDailyRoutes[todayKey];
+        return (r != null && r.isNotEmpty)
+            ? List<LatLng>.from(r)
+            : [fallbackLoc];
+      } else if (tabIndex == 1) {
+        final r = myDailyRoutes[yesterdayKey];
+        return (r != null && r.isNotEmpty) ? List<LatLng>.from(r) : <LatLng>[];
+      } else {
+        final all = <LatLng>[];
+        final sortedKeys = myDailyRoutes.keys.toList()..sort();
+        for (final k in sortedKeys) {
+          all.addAll(myDailyRoutes[k]!);
+        }
+        return all.isNotEmpty ? all : [fallbackLoc];
+      }
+    } else {
+      final mMap = memberDailyRoutes[memberId];
+      if (mMap == null) return tabIndex == 0 ? [fallbackLoc] : <LatLng>[];
+      if (tabIndex == 0) {
+        final r = mMap[todayKey];
+        return (r != null && r.isNotEmpty)
+            ? List<LatLng>.from(r)
+            : [fallbackLoc];
+      } else if (tabIndex == 1) {
+        final r = mMap[yesterdayKey];
+        return (r != null && r.isNotEmpty) ? List<LatLng>.from(r) : <LatLng>[];
+      } else {
+        final all = <LatLng>[];
+        final sortedKeys = mMap.keys.toList()..sort();
+        for (final k in sortedKeys) {
+          all.addAll(mMap[k]!);
+        }
+        return all.isNotEmpty ? all : [fallbackLoc];
+      }
+    }
+  }
+
+  double computeRouteDistanceKm(List<LatLng> pts) {
+    if (pts.length < 2) return 0.0;
+    double sumM = 0.0;
+    for (int i = 1; i < pts.length; i++) {
+      sumM += calculateDistanceMeters(pts[i - 1], pts[i]);
+    }
+    return sumM / 1000.0;
+  }
+
+  double getMaxSpeedForMemberTab(
+    String memberId,
+    int tabIndex,
+    double currentSpd,
+  ) {
+    final isMe = memberId == 'm1' || memberId == currentUserId;
+    if (isMe) {
+      if (tabIndex == 0) {
+        return math.max(myDailyMaxSpeed[todayKey] ?? 0.0, currentSpd);
+      } else if (tabIndex == 1) {
+        return myDailyMaxSpeed[yesterdayKey] ?? 0.0;
+      } else {
+        double m = currentSpd;
+        for (final v in myDailyMaxSpeed.values) {
+          if (v > m) m = v;
+        }
+        return m;
+      }
+    } else {
+      return math.max(memberMaxSpeedMap[memberId] ?? 0.0, currentSpd);
+    }
+  }
+
+  String _encodeMyCompactRouteMeta() {
+    List<List<double>> compress(List<LatLng>? src, int maxPts) {
+      if (src == null || src.isEmpty) return [];
+      if (src.length <= maxPts) {
+        return src
+            .map(
+              (p) => [
+                double.parse(p.latitude.toStringAsFixed(4)),
+                double.parse(p.longitude.toStringAsFixed(4)),
+              ],
+            )
+            .toList();
+      }
+      final step = (src.length - 1) / (maxPts - 1);
+      final out = <List<double>>[];
+      for (int i = 0; i < maxPts; i++) {
+        final pt = src[(i * step).round().clamp(0, src.length - 1)];
+        out.add([
+          double.parse(pt.latitude.toStringAsFixed(4)),
+          double.parse(pt.longitude.toStringAsFixed(4)),
+        ]);
+      }
+      return out;
+    }
+
+    final map = <String, dynamic>{
+      't': compress(myDailyRoutes[todayKey], 25),
+      'y': compress(myDailyRoutes[yesterdayKey], 18),
+      'ms': double.parse((myDailyMaxSpeed[todayKey] ?? 0.0).toStringAsFixed(1)),
+    };
+    return base64Encode(utf8.encode(jsonEncode(map)));
+  }
+
+  Future<void> decodeAndStoreRemoteMemberRoute(
+    String uid,
+    String encodedB64,
+    LatLng currentPt,
+    double currentSpd,
+  ) async {
+    final mMap = memberDailyRoutes.putIfAbsent(
+      uid,
+      () => <String, List<LatLng>>{},
+    );
+    if (currentSpd > (memberMaxSpeedMap[uid] ?? 0.0)) {
+      memberMaxSpeedMap[uid] = currentSpd;
+    }
+    if (encodedB64.isNotEmpty) {
+      try {
+        final jsonStr = utf8.decode(base64Decode(encodedB64));
+        final data = jsonDecode(jsonStr) as Map<String, dynamic>;
+        if (data['t'] is List) {
+          final tPts = <LatLng>[];
+          for (final item in (data['t'] as List)) {
+            if (item is List && item.length >= 2) {
+              tPts.add(
+                LatLng(
+                  (item[0] as num).toDouble(),
+                  (item[1] as num).toDouble(),
+                ),
+              );
+            }
+          }
+          if (tPts.isNotEmpty) mMap[todayKey] = tPts;
+        }
+        if (data['y'] is List) {
+          final yPts = <LatLng>[];
+          for (final item in (data['y'] as List)) {
+            if (item is List && item.length >= 2) {
+              yPts.add(
+                LatLng(
+                  (item[0] as num).toDouble(),
+                  (item[1] as num).toDouble(),
+                ),
+              );
+            }
+          }
+          if (yPts.isNotEmpty) mMap[yesterdayKey] = yPts;
+        }
+        if (data['ms'] is num) {
+          final ms = (data['ms'] as num).toDouble();
+          if (ms > (memberMaxSpeedMap[uid] ?? 0.0)) {
+            memberMaxSpeedMap[uid] = ms;
+          }
+        }
+      } catch (_) {}
+    }
+    final tList = mMap.putIfAbsent(todayKey, () => <LatLng>[]);
+    if (tList.isEmpty) {
+      tList.add(currentPt);
+    } else if (calculateDistanceMeters(tList.last, currentPt) >= 12.0) {
+      tList.add(currentPt);
+    }
+    try {
+      final out = <String, dynamic>{};
+      memberDailyRoutes.forEach((mUid, dMap) {
+        out[mUid] = {};
+        dMap.forEach((dKey, pts) {
+          out[mUid][dKey] = pts
+              .map(
+                (p) => [
+                  double.parse(p.latitude.toStringAsFixed(4)),
+                  double.parse(p.longitude.toStringAsFixed(4)),
+                ],
+              )
+              .toList();
+        });
+      });
+      await _writePersistentText(
+        'pingo_remote_timelines_v3.json',
+        jsonEncode(out),
+      );
+    } catch (_) {}
   }
 
   static String generateRandomInviteCode() {
@@ -160,7 +548,8 @@ class AppEngineService {
     String? bodyText,
     String? body,
   }) async {
-    final targetPhone = (phone ?? rawPhone ?? '').replaceAll(RegExp(r'[^0-9+]'), '');
+    final targetPhone =
+        (phone ?? rawPhone ?? '').replaceAll(RegExp(r'[^0-9+]'), '');
     final msg = bodyText ?? body ?? '';
     final Uri uri = msg.isNotEmpty
         ? Uri(
@@ -226,7 +615,10 @@ class AppEngineService {
               children: [
                 Text(
                   AppStrings.t('avatar_picker_title'),
-                  style: const TextStyle(fontSize: 17, fontWeight: FontWeight.w900),
+                  style: const TextStyle(
+                    fontSize: 17,
+                    fontWeight: FontWeight.w900,
+                  ),
                 ),
                 const SizedBox(height: 12),
                 Row(
@@ -243,7 +635,8 @@ class AppEngineService {
                             );
                             if (xfile != null) {
                               final bytes = await xfile.readAsBytes();
-                              final dataUrl = 'data:image/jpeg;base64,${base64Encode(bytes)}';
+                              final b64 = base64Encode(bytes);
+                              final dataUrl = 'data:image/jpeg;base64,$b64';
                               instance.myCustomAvatarDataUrl = dataUrl;
                               if (onSelected != null) onSelected(dataUrl);
                               if (ctx.mounted) Navigator.pop(ctx, dataUrl);
@@ -251,7 +644,10 @@ class AppEngineService {
                           } catch (_) {}
                         },
                         icon: const Icon(Icons.photo_library_rounded, size: 18),
-                        label: Text(AppStrings.t('pick_photo_gallery')),
+                        label: FittedBox(
+                          fit: BoxFit.scaleDown,
+                          child: Text(AppStrings.t('pick_photo_gallery')),
+                        ),
                         style: ElevatedButton.styleFrom(
                           backgroundColor: const Color(0xFF6C47FF),
                           foregroundColor: Colors.white,
@@ -271,7 +667,8 @@ class AppEngineService {
                             );
                             if (xfile != null) {
                               final bytes = await xfile.readAsBytes();
-                              final dataUrl = 'data:image/jpeg;base64,${base64Encode(bytes)}';
+                              final b64 = base64Encode(bytes);
+                              final dataUrl = 'data:image/jpeg;base64,$b64';
                               instance.myCustomAvatarDataUrl = dataUrl;
                               if (onSelected != null) onSelected(dataUrl);
                               if (ctx.mounted) Navigator.pop(ctx, dataUrl);
@@ -279,7 +676,10 @@ class AppEngineService {
                           } catch (_) {}
                         },
                         icon: const Icon(Icons.camera_alt_rounded, size: 18),
-                        label: Text(AppStrings.t('pick_photo_camera')),
+                        label: FittedBox(
+                          fit: BoxFit.scaleDown,
+                          child: Text(AppStrings.t('pick_photo_camera')),
+                        ),
                       ),
                     ),
                   ],
@@ -310,7 +710,10 @@ class AppEngineService {
                             width: 2,
                           ),
                         ),
-                        child: Text(emoji, style: const TextStyle(fontSize: 22)),
+                        child: Text(
+                          emoji,
+                          style: const TextStyle(fontSize: 22),
+                        ),
                       ),
                     );
                   }).toList(),
@@ -329,17 +732,15 @@ class AppEngineService {
     String? userName,
   }) async {
     if (!isSupabaseReady || currentUserId.isEmpty) return;
-    final targetName = myUserName.isNotEmpty ? myUserName : (userName ?? '');
-    if (targetName.isEmpty) return;
     try {
       final scopedId = buildCircleScopedUserId(circleCode);
-      await Supabase.instance.client
-          .from('locations')
-          .delete()
-          .eq('circle_code', circleCode)
-          .eq('user_name', targetName)
-          .neq('user_id', scopedId)
-          .neq('user_id', currentUserId);
+      if (scopedId != currentUserId) {
+        await Supabase.instance.client
+            .from('locations')
+            .delete()
+            .eq('circle_code', circleCode)
+            .eq('user_id', scopedId);
+      }
     } catch (_) {}
   }
 
@@ -380,9 +781,11 @@ class AppEngineService {
       final available = await InAppPurchase.instance.isAvailable();
       if (!available) return false;
       final targetId = isYearly ? kProYearlyId : kProMonthlyId;
-      final response = await InAppPurchase.instance.queryProductDetails({targetId});
+      final response =
+          await InAppPurchase.instance.queryProductDetails({targetId});
       if (response.productDetails.isNotEmpty) {
-        final param = PurchaseParam(productDetails: response.productDetails.first);
+        final param =
+            PurchaseParam(productDetails: response.productDetails.first);
         await InAppPurchase.instance.buyNonConsumable(purchaseParam: param);
         return true;
       }
@@ -414,27 +817,28 @@ class AppEngineService {
     List<SafePlaceData>? safePlaces,
     bool forceLookup = false,
   }) async {
-    if (!forceLookup && speedKmh >= 4.5) {
-      return '🚗 ${AppStrings.t('Filter_Moving')} (${speedKmh.toStringAsFixed(0)} km/h)';
+    if (!forceLookup && speedKmh >= 15.0) {
+      return '🚗 ${AppStrings.t('filter_moving')} (${speedKmh.toStringAsFixed(0)} km/h)';
     }
-
     const lang = 'ko';
-    final key = '${point.latitude.toStringAsFixed(3)}_${point.longitude.toStringAsFixed(3)}';
+    final key =
+        '${point.latitude.toStringAsFixed(3)}_${point.longitude.toStringAsFixed(3)}';
     if (_roadAddressCache.containsKey(key)) {
       return _roadAddressCache[key]!;
     }
-
     final lastCoord = _lastGeocodedCoordByKey[lang];
     final lastTime = _lastGeocodedTimeByKey[lang];
     if (!forceLookup && lastCoord != null && lastTime != null) {
       final movedMeters = calculateDistanceMeters(lastCoord, point);
       final elapsedSec = DateTime.now().difference(lastTime).inSeconds;
-      if (movedMeters < 250.0 && elapsedSec < 180 && _roadAddressCache.isNotEmpty) {
+      if (movedMeters < 65.0 &&
+          elapsedSec < 180 &&
+          _roadAddressCache.isNotEmpty) {
         return _roadAddressCache.values.last;
       }
     }
-
-    const token = 'pk.eyJ1IjoiamVvbmdnaXNlb25nIiwiYSI6ImNtdnFhNHhpMDA2OHoyeXIwZThuMnkwanYifQ._Zouj-a9d2NaLWCVyRKwiQ';
+    const token =
+        'pk.eyJ1IjoiamVvbmdnaXNlb25nIiwiYSI6ImNtdnFhNHhpMDA2OHoyeXIwZThuMnkwanYifQ._Zouj-a9d2NaLWCVyRKwiQ';
     final url = Uri.parse(
       'https://api.mapbox.com/geocoding/v5/mapbox.places/${point.longitude},${point.latitude}.json'
       '?types=address,poi,neighborhood,locality,place&language=ko&limit=1&access_token=$token',
@@ -454,7 +858,11 @@ class AppEngineService {
           }
           final fullAddr = contextStr.isNotEmpty && contextStr != placeText
               ? '$contextStr $placeText'
-              : (f['place_name'] ?? placeText).toString().split(',').take(2).join(' ');
+              : (f['place_name'] ?? placeText)
+                  .toString()
+                  .split(',')
+                  .take(2)
+                  .join(' ');
           if (fullAddr.trim().isNotEmpty) {
             _roadAddressCache[key] = fullAddr.trim();
             _lastGeocodedCoordByKey[lang] = point;
@@ -475,7 +883,10 @@ class AppEngineService {
     return _computeSmoothedRoute(firstPointOrList, secondPoint);
   }
 
-  List<LatLng> _computeSmoothedRoute(dynamic firstPointOrList, [LatLng? secondPoint]) {
+  List<LatLng> _computeSmoothedRoute(
+    dynamic firstPointOrList, [
+    LatLng? secondPoint,
+  ]) {
     List<LatLng> waypoints = [];
     if (firstPointOrList is List<LatLng>) {
       waypoints = firstPointOrList;
@@ -483,20 +894,23 @@ class AppEngineService {
       waypoints = [firstPointOrList, secondPoint];
     }
     if (waypoints.length < 2) return waypoints;
-
     final List<LatLng> smoothed = [];
     for (int i = 0; i < waypoints.length - 1; i++) {
       final p0 = waypoints[i];
       final p1 = waypoints[i + 1];
       smoothed.add(p0);
-      smoothed.add(LatLng(
-        p0.latitude * 0.67 + p1.latitude * 0.33,
-        p0.longitude * 0.67 + p1.longitude * 0.33,
-      ));
-      smoothed.add(LatLng(
-        p0.latitude * 0.33 + p1.latitude * 0.67,
-        p0.longitude * 0.33 + p1.longitude * 0.67,
-      ));
+      smoothed.add(
+        LatLng(
+          p0.latitude * 0.67 + p1.latitude * 0.33,
+          p0.longitude * 0.67 + p1.longitude * 0.33,
+        ),
+      );
+      smoothed.add(
+        LatLng(
+          p0.latitude * 0.33 + p1.latitude * 0.67,
+          p0.longitude * 0.33 + p1.longitude * 0.67,
+        ),
+      );
     }
     smoothed.add(waypoints.last);
     return smoothed;
@@ -518,9 +932,14 @@ class AppEngineService {
     bool forceImmediate = false,
   }) async {
     if (!isSupabaseReady) return;
+    if (currentUserId.isEmpty) {
+      await _loadOrGeneratePersistentDeviceId();
+    }
     final targetPos = point ?? position ?? const LatLng(37.5665, 126.9780);
     final targetBat = battery ?? batteryLevel ?? 90;
     final rawClip = audioClipDataUrl ?? signalClip ?? '';
+
+    await recordMyLocationBreadcrumb(targetPos, speedKmh: speedKmh);
 
     if (avatarUrl != null && avatarUrl.isNotEmpty) {
       myCustomAvatarDataUrl = avatarUrl;
@@ -528,13 +947,17 @@ class AppEngineService {
 
     final hasUrgentSignal = isSos ||
         forceImmediate ||
-        (rawClip.isNotEmpty && !rawClip.startsWith('BUBBLE::'));
-
+        (rawClip.isNotEmpty &&
+            !rawClip.startsWith('BUBBLE::') &&
+            !rawClip.startsWith('META::'));
     final now = DateTime.now();
-    if (!hasUrgentSignal && _lastServerPushTime != null && _lastServerPushLatLng != null) {
+    if (!hasUrgentSignal &&
+        _lastServerPushTime != null &&
+        _lastServerPushLatLng != null) {
       final elapsedSec = now.difference(_lastServerPushTime!).inSeconds;
-      final movedMeters = calculateDistanceMeters(_lastServerPushLatLng!, targetPos);
-      if (elapsedSec < 15 && movedMeters < 20.0) {
+      final movedMeters =
+          calculateDistanceMeters(_lastServerPushLatLng!, targetPos);
+      if (elapsedSec < 8 && movedMeters < 12.0) {
         return;
       }
     }
@@ -545,18 +968,23 @@ class AppEngineService {
     if (rawClip.isNotEmpty) {
       activeSignalEnvelope = rawClip;
       activeSignalExpiresAt = now.add(const Duration(seconds: 30));
-    } else if (activeSignalExpiresAt != null && now.isAfter(activeSignalExpiresAt!)) {
+    } else if (activeSignalExpiresAt != null &&
+        now.isAfter(activeSignalExpiresAt!)) {
       activeSignalEnvelope = '';
       activeSignalExpiresAt = null;
     }
 
+    final routeB64 = _encodeMyCompactRouteMeta();
+    final phoneTrimmed = myPhoneNumber.trim();
+    final baseMeta = isBubblePrivacyActive
+        ? 'BUBBLE::ON::$phoneTrimmed::ROUTE::$routeB64'
+        : 'META::PHONE::$phoneTrimmed::ROUTE::$routeB64';
+
     final effectiveClip = rawClip.isNotEmpty
-        ? rawClip
+        ? '$rawClip::ROUTE::$routeB64'
         : (activeSignalEnvelope.isNotEmpty
-            ? activeSignalEnvelope
-            : (isBubblePrivacyActive
-                ? 'BUBBLE::ON::${myPhoneNumber.trim()}'
-                : (myPhoneNumber.trim().isNotEmpty ? 'META::PHONE::${myPhoneNumber.trim()}' : '')));
+            ? '$activeSignalEnvelope::ROUTE::$routeB64'
+            : baseMeta);
 
     double sendLat = targetPos.latitude;
     double sendLng = targetPos.longitude;
@@ -565,12 +993,12 @@ class AppEngineService {
       sendLng = double.parse(targetPos.longitude.toStringAsFixed(2));
     }
 
-    final payload = <String, dynamic>{
+    final payloadPrimary = <String, dynamic>{
       'user_id': currentUserId,
       'circle_code': circleCode,
       'user_name': userName,
-      'lat': sendLat,
-      'lng': sendLng,
+      'latitude': sendLat,
+      'longitude': sendLng,
       'speed_kmh': speedKmh,
       'battery_level': targetBat,
       'is_sos': isSos,
@@ -578,30 +1006,62 @@ class AppEngineService {
       'updated_at': now.toIso8601String(),
     };
     if (myCustomAvatarDataUrl.isNotEmpty) {
-      payload['avatar_url'] = myCustomAvatarDataUrl;
+      payloadPrimary['avatar_url'] = myCustomAvatarDataUrl;
     }
 
     try {
-      await Supabase.instance.client.from('locations').upsert(payload);
-    } catch (_) {}
+      await Supabase.instance.client.from('locations').upsert(payloadPrimary);
+    } catch (_) {
+      try {
+        final payloadFallback = <String, dynamic>{
+          'user_id': currentUserId,
+          'circle_code': circleCode,
+          'user_name': userName,
+          'lat': sendLat,
+          'lng': sendLng,
+          'speed_kmh': speedKmh,
+          'battery_level': targetBat,
+          'is_sos': isSos,
+          'audio_clip': effectiveClip,
+          'updated_at': now.toIso8601String(),
+        };
+        if (myCustomAvatarDataUrl.isNotEmpty) {
+          payloadFallback['avatar_url'] = myCustomAvatarDataUrl;
+        }
+        await Supabase.instance.client
+            .from('locations')
+            .upsert(payloadFallback);
+      } catch (_) {}
+    }
   }
 
   Future<void> deleteMyServerDataAndReset() async {
     await deleteUserAccountAndData();
   }
 
-  Future<void> deleteUserAccountAndData([List<CircleInfo>? joinedCircles]) async {
+  Future<void> deleteUserAccountAndData([
+    List<CircleInfo>? joinedCircles,
+  ]) async {
     if (!isSupabaseReady) return;
     try {
       if (currentUserId.isNotEmpty) {
-        await Supabase.instance.client.from('locations').delete().eq('user_id', currentUserId);
+        await Supabase.instance.client
+            .from('locations')
+            .delete()
+            .eq('user_id', currentUserId);
       }
-      final sessionFile = File('${Directory.systemTemp.path}/pingo_saved_session_v1.json');
-      if (await sessionFile.exists()) await sessionFile.delete();
+      for (final fName in [
+        'pingo_saved_session_v1.json',
+        'pingo_timeline_history_v3.json',
+        'pingo_remote_timelines_v3.json',
+      ]) {
+        final f1 = _storageFile(fName);
+        if (await f1.exists()) await f1.delete();
+        final f2 = _fallbackTempFile(fName);
+        if (await f2.exists()) await f2.delete();
+      }
     } catch (_) {}
   }
-
-  File get _localSessionFile => File('${Directory.systemTemp.path}/pingo_saved_session_v1.json');
 
   Future<void> saveLocalCirclesState({
     required List<CircleInfo> circles,
@@ -611,6 +1071,9 @@ class AppEngineService {
     List<LatLng>? myRecentRoute,
   }) async {
     try {
+      if (myRecentRoute != null && myRecentRoute.isNotEmpty) {
+        myDailyRoutes[todayKey] = List<LatLng>.from(myRecentRoute);
+      }
       final data = {
         'userName': userName,
         'myPhoneNumber': myPhoneNumber,
@@ -625,21 +1088,20 @@ class AppEngineService {
         'blockedUserIds': blockedUserIds.toList(),
         'circleHiddenMap': circleHiddenMap,
         'circles': circles
-            .map((c) => {
-                  'name': c.name,
-                  'code': c.code,
-                  'myRole': c.myRole,
-                })
+            .map((c) => {'name': c.name, 'code': c.code, 'myRole': c.myRole})
             .toList(),
       };
-      await _localSessionFile.writeAsString(jsonEncode(data), flush: true);
+      await _writePersistentText(
+        'pingo_saved_session_v1.json',
+        jsonEncode(data),
+      );
     } catch (_) {}
   }
 
-  Future<Map<String, dynamic>?> loadLocalCirclesState() async {
+  Future<dynamic> loadLocalCirclesState() async {
     try {
-      if (!await _localSessionFile.exists()) return null;
-      final raw = await _localSessionFile.readAsString();
+      final raw = await _readPersistentText('pingo_saved_session_v1.json');
+      if (raw.isEmpty) return null;
       final decoded = jsonDecode(raw) as Map<String, dynamic>;
       if (decoded['avatarDataUrl'] != null) {
         myCustomAvatarDataUrl = decoded['avatarDataUrl'].toString();

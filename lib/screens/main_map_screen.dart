@@ -323,7 +323,7 @@ class _MainLife360MapScreenState extends State<MainLife360MapScreen>
       ),
     );
   }
-  Future<void> _initRealRoadAddressesAndRoutes() async {
+      Future<void> _initRealRoadAddressesAndRoutes() async {
     for (int i = 0; i < _allMembers.length; i++) {
       final addr = await AppEngineService.instance.fetchRoadAddress(
         _allMembers[i].location,
@@ -331,7 +331,18 @@ class _MainLife360MapScreenState extends State<MainLife360MapScreen>
       if (!mounted) return;
       setState(() {
         _allMembers[i].statusText = '$addr • ${AppStrings.t('just_now')}';
-        _allMembers[i].recentRoute = [_allMembers[i].location];
+        if (i == 0) {
+          final savedToday = AppEngineService.instance.getRouteForMemberTab(
+            'm1',
+            0,
+            _allMembers[0].location,
+          );
+          _allMembers[0].recentRoute = savedToday.isNotEmpty
+              ? savedToday
+              : [_allMembers[0].location];
+        } else if (_allMembers[i].recentRoute.isEmpty) {
+          _allMembers[i].recentRoute = [_allMembers[i].location];
+        }
       });
     }
   }
@@ -465,8 +476,21 @@ class _MainLife360MapScreenState extends State<MainLife360MapScreen>
     });
   }
 
-  void _subscribeToSupabaseRealtimeLocations() {
+    void _subscribeToSupabaseRealtimeLocations() {
     try {
+      _realtimeLocationSub?.cancel();
+      // 방 입장 직후 내 현재 위치를 즉시 1회 강제 발송하여 상대방 화면에 나를 즉시 생성
+      if (_allMembers.isNotEmpty) {
+        AppEngineService.instance.pushLiveLocationToServer(
+          circleCode: activeCircle.code,
+          userName: _allMembers[0].name,
+          point: _allMembers[0].location,
+          battery: _allMembers[0].battery,
+          avatarUrl: _allMembers[0].avatarUrl,
+          speedKmh: _allMembers[0].speedKmh,
+          forceImmediate: true,
+        );
+      }
       _realtimeLocationSub = Supabase.instance.client
           .from('locations')
           .stream(primaryKey: ['user_id'])
@@ -478,10 +502,10 @@ class _MainLife360MapScreenState extends State<MainLife360MapScreen>
                   row['user_name']?.toString() ??
                   AppStrings.t('default_member_name');
 
-              // 본인 ID이거나 본인 닉네임과 동일한 과거 유령 행(Row)은 완벽 차단!
+              // 오직 기기 고유 ID(currentUserId)가 나 자신일 때만 스킵 (동명이인/기본이름 차단 버그 제거)
               if (uid == null ||
                   uid == AppEngineService.instance.currentUserId ||
-                  uName.trim() == _allMembers[0].name.trim()) {
+                  uid == AppEngineService.instance.buildCircleScopedUserId(activeCircle.code)) {
                 continue;
               }
               if (_blockedMemberIds.contains(uid)) continue;
@@ -493,22 +517,37 @@ class _MainLife360MapScreenState extends State<MainLife360MapScreen>
                 continue;
               }
 
-              final lat = (row['latitude'] as num?)?.toDouble();
-              final lng = (row['longitude'] as num?)?.toDouble();
+              // latitude/longitude 와 lat/lng 컬럼 모두 100% 호환 파싱
+              final lat = ((row['latitude'] ?? row['lat']) as num?)?.toDouble();
+              final lng = ((row['longitude'] ?? row['lng']) as num?)?.toDouble();
               final bat = (row['battery_level'] as num?)?.toInt() ?? 88;
               final spd = (row['speed_kmh'] as num?)?.toDouble() ?? 0.0;
               final isRowSos = row['is_sos'] == true;
               final uAvatar =
                   row['avatar_url']?.toString() ??
                   PingoAvatars.presets[1]['url']!;
-              final incomingSignal = row['audio_clip']?.toString();
+              final rawSignal = row['audio_clip']?.toString() ?? '';
 
               if (lat == null || lng == null) continue;
               final newPoint = LatLng(lat, lng);
 
-              // 상대방 버블 프라이버시 상태 및 전화번호 메타데이터 파싱
+              // 패킷 내 압축된 상대방 타임라인(::ROUTE::<b64>) 분리 추출 및 캐싱
+              String incomingSignal = rawSignal;
+              String encodedRouteB64 = '';
+              if (rawSignal.contains('::ROUTE::')) {
+                final rSplit = rawSignal.split('::ROUTE::');
+                incomingSignal = rSplit.first;
+                encodedRouteB64 = rSplit.last.trim();
+              }
+              AppEngineService.instance.decodeAndStoreRemoteMemberRoute(
+                uid,
+                encodedRouteB64,
+                newPoint,
+                spd,
+              );
+
               final bool isRemoteBubble =
-                  incomingSignal != null && incomingSignal.startsWith('BUBBLE::ON');
+                  incomingSignal.startsWith('BUBBLE::ON');
               if (isRemoteBubble) {
                 _otherBubbleMemberIds.add(uid);
                 final bParts = incomingSignal.split('::');
@@ -517,7 +556,7 @@ class _MainLife360MapScreenState extends State<MainLife360MapScreen>
                 }
               } else {
                 _otherBubbleMemberIds.remove(uid);
-                if (incomingSignal != null && incomingSignal.startsWith('META::PHONE::')) {
+                if (incomingSignal.startsWith('META::PHONE::')) {
                   final ph = incomingSignal.replaceFirst('META::PHONE::', '').trim();
                   if (ph.isNotEmpty) {
                     AppEngineService.instance.memberPhones[uid] = ph;
@@ -525,6 +564,13 @@ class _MainLife360MapScreenState extends State<MainLife360MapScreen>
                 }
               }
 
+              final syncedTodayRoute = AppEngineService.instance.getRouteForMemberTab(
+                uid,
+                0,
+                newPoint,
+              );
+
+              bool isNewlyDiscoveredMember = false;
               setState(() {
                 final existIdx = _allMembers.indexWhere((m) => m.id == uid);
                 if (existIdx != -1) {
@@ -533,27 +579,13 @@ class _MainLife360MapScreenState extends State<MainLife360MapScreen>
                   _allMembers[existIdx].battery = bat;
                   _allMembers[existIdx].speedKmh = spd;
                   _allMembers[existIdx].avatarUrl = uAvatar;
+                  _allMembers[existIdx].recentRoute = syncedTodayRoute;
                   if (isRemoteBubble) {
                     _allMembers[existIdx].statusText =
                         AppStrings.t('bubble_masked_addr');
                   }
-                  if (_allMembers[existIdx].recentRoute.isEmpty) {
-                    _allMembers[existIdx].recentRoute = [newPoint];
-                  } else {
-                    final lastPt = _allMembers[existIdx].recentRoute.last;
-                    if (AppEngineService.instance.calculateDistanceMeters(
-                          lastPt,
-                          newPoint,
-                        ) >=
-                        15.0) {
-                      _allMembers[existIdx].recentRoute = [
-                        ..._allMembers[existIdx].recentRoute,
-                        newPoint,
-                      ];
-                    }
-                  }
                 } else {
-                  // 새로운 가족이 합류했을 때 내 위치도 즉시 재전송하여 양방향 동기화 보장
+                  isNewlyDiscoveredMember = true;
                   _allMembers.add(
                     MemberData(
                       id: uid,
@@ -575,7 +607,7 @@ class _MainLife360MapScreenState extends State<MainLife360MapScreen>
                       battery: bat,
                       speedKmh: spd,
                       location: newPoint,
-                      recentRoute: [newPoint],
+                      recentRoute: syncedTodayRoute,
                     ),
                   );
                   if (!isRemoteBubble) {
@@ -595,7 +627,19 @@ class _MainLife360MapScreenState extends State<MainLife360MapScreen>
                 }
               });
 
-              // 상대방 SOS 수신 시 즉시 카메라 이동 및 긴급 배너 표시
+              // 새 가족이 내 화면에 처음 추가된 순간, 내 위치도 즉시 강제 답장(Sync-Ack)하여 상대방 폰에도 나를 즉시 생성!
+              if (isNewlyDiscoveredMember && _allMembers.isNotEmpty) {
+                AppEngineService.instance.pushLiveLocationToServer(
+                  circleCode: activeCircle.code,
+                  userName: _allMembers[0].name,
+                  point: _allMembers[0].location,
+                  battery: _allMembers[0].battery,
+                  avatarUrl: _allMembers[0].avatarUrl,
+                  speedKmh: _allMembers[0].speedKmh,
+                  forceImmediate: true,
+                );
+              }
+
               if (isRowSos &&
                   _lastProcessedIncomingSignal['SOS_$uid'] != 'ACTIVE') {
                 _lastProcessedIncomingSignal['SOS_$uid'] = 'ACTIVE';
@@ -603,15 +647,13 @@ class _MainLife360MapScreenState extends State<MainLife360MapScreen>
                 _triggerIncomingDynamicBanner(
                   senderId: uid,
                   senderName: uName,
-                  messageText: '🚨 SOS! ${AppStrings.t('sos_Active_banner')}',
+                  messageText: '🚨 SOS! ${AppStrings.t('sos_active_banner')}',
                 );
               } else if (!isRowSos) {
                 _lastProcessedIncomingSignal.remove('SOS_$uid');
               }
 
-              // 실시간 이모지 퀵 노트(PING) / 체크인(CHECKIN) / 장소알림(PLACE) 수신 처리 (35초 이내 최신 신호만 울림)
-              if (incomingSignal != null &&
-                  incomingSignal.isNotEmpty &&
+              if (incomingSignal.isNotEmpty &&
                   !incomingSignal.startsWith('BUBBLE::') &&
                   !incomingSignal.startsWith('META::') &&
                   _lastProcessedIncomingSignal[uid] != incomingSignal) {
@@ -622,7 +664,6 @@ class _MainLife360MapScreenState extends State<MainLife360MapScreen>
                   final rawMsg = parts[1];
                   final ts = parts.length >= 3 ? int.tryParse(parts[2]) : null;
                   final nowMs = DateTime.now().millisecondsSinceEpoch;
-                  // 과거에 쌓인 오래된 신호가 뒷북으로 울리는 현상 원천 차단 (35초 유효기간)
                   if (ts == null || (nowMs - ts).abs() <= 35000) {
                     if (parts.length >= 4 && parts[3].isNotEmpty) {
                       AppEngineService.instance.memberPhones[uid] = parts[3];
@@ -3542,10 +3583,9 @@ class _MainLife360MapScreenState extends State<MainLife360MapScreen>
     );
   }
 
-  Widget _buildMemberHistoryDrillDownSheet(MemberData member) {
+    Widget _buildMemberHistoryDrillDownSheet(MemberData member) {
     final bool isMe = member.id == 'm1';
 
-    // Life360을 뛰어넘는 듀얼 파스텔 그라데이션 이모지 퀵 노트 8종 세트
     final emojiQuickNotes = [
       {
         'key': 'q_where',
@@ -3602,28 +3642,42 @@ class _MainLife360MapScreenState extends State<MainLife360MapScreen>
         '${now.hour.toString().padLeft(2, '0')}:${now.minute.toString().padLeft(2, '0')}';
     final tPrev1 =
         '${now.subtract(const Duration(minutes: 45)).hour.toString().padLeft(2, '0')}:${now.subtract(const Duration(minutes: 45)).minute.toString().padLeft(2, '0')}';
-    final tPrev2 =
-        '${now.subtract(const Duration(hours: 2)).hour.toString().padLeft(2, '0')}:${now.subtract(const Duration(hours: 2)).minute.toString().padLeft(2, '0')}';
 
-    double totalDistKm = 0.0;
-    for (int i = 1; i < member.recentRoute.length; i++) {
-      totalDistKm +=
-          AppEngineService.instance.calculateDistanceMeters(
-            member.recentRoute[i - 1],
-            member.recentRoute[i],
-          ) /
-          1000.0;
-    }
+    // 선택된 탭(0:오늘, 1:어제, 2:30일)에 따른 실제 저장 경로 및 거리·최고속도 계산
+    final activeTabRoute = AppEngineService.instance.getRouteForMemberTab(
+      member.id,
+      _selectedHistoryDayTab,
+      member.location,
+    );
+    final tabDistKm =
+        AppEngineService.instance.computeRouteDistanceKm(activeTabRoute);
+    final tabMaxSpeed = AppEngineService.instance.getMaxSpeedForMemberTab(
+      member.id,
+      _selectedHistoryDayTab,
+      member.speedKmh,
+    );
 
     final cleanAddr = member.statusText.split('•').first.trim();
+    final bubbleOn = AppEngineService.instance.isBubblePrivacyActive;
 
-    // [옵션 B] 본인('나')을 클릭했을 때: 타임라인(오늘/어제/30일) + 버블 프라이버시 모드 스위치
-    if (isMe) {
-      final bubbleOn = AppEngineService.instance.isBubblePrivacyActive;
-      return Column(
-        mainAxisSize: MainAxisSize.min,
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
+    void switchTimelineTab(int newTab) {
+      setState(() {
+        _selectedHistoryDayTab = newTab;
+        final pts = AppEngineService.instance.getRouteForMemberTab(
+          member.id,
+          newTab,
+          member.location,
+        );
+        member.recentRoute = pts.isNotEmpty ? pts : [member.location];
+      });
+    }
+
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        // 1단 헤더: 나(본인) vs 등록된 가족/친구
+        if (isMe)
           Row(
             children: [
               IconButton(
@@ -3640,6 +3694,8 @@ class _MainLife360MapScreenState extends State<MainLife360MapScreen>
               Expanded(
                 child: Text(
                   AppStrings.t('my_timeline_btn'),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
                   style: const TextStyle(
                     fontSize: 15,
                     fontWeight: FontWeight.bold,
@@ -3649,9 +3705,174 @@ class _MainLife360MapScreenState extends State<MainLife360MapScreen>
               ),
               _buildSmartMotionBadge(member),
             ],
+          )
+        else
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              Expanded(
+                child: Row(
+                  children: [
+                    IconButton(
+                      visualDensity: VisualDensity.compact,
+                      icon: const Icon(
+                        Icons.arrow_back_ios_new_rounded,
+                        size: 17,
+                      ),
+                      onPressed: () => setState(() => selectedMemberId = null),
+                    ),
+                    _buildMemberAvatarImage(member, size: 32),
+                    const SizedBox(width: 8),
+                    Flexible(
+                      child: Text(
+                        member.name,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          fontSize: 16,
+                          fontWeight: FontWeight.w900,
+                          color: AppColors.textDark,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  InkWell(
+                    onTap: () => _handleMemberPhoneAction(
+                      member: member,
+                      isCall: true,
+                    ),
+                    borderRadius: BorderRadius.circular(20),
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 10,
+                        vertical: 6,
+                      ),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFFD1FAE5),
+                        borderRadius: BorderRadius.circular(18),
+                        border: Border.all(color: const Color(0xFF10B981)),
+                      ),
+                      child: Row(
+                        children: [
+                          const Icon(
+                            Icons.call_rounded,
+                            size: 14,
+                            color: Color(0xFF047857),
+                          ),
+                          const SizedBox(width: 4),
+                          FittedBox(
+                            fit: BoxFit.scaleDown,
+                            child: Text(
+                              AppStrings.t('call_btn'),
+                              style: const TextStyle(
+                                fontSize: 11.5,
+                                fontWeight: FontWeight.bold,
+                                color: Color(0xFF047857),
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 6),
+                  InkWell(
+                    onTap: () => _handleMemberPhoneAction(
+                      member: member,
+                      isCall: false,
+                    ),
+                    borderRadius: BorderRadius.circular(20),
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 10,
+                        vertical: 6,
+                      ),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFFDBEAFE),
+                        borderRadius: BorderRadius.circular(18),
+                        border: Border.all(color: const Color(0xFF3B82F6)),
+                      ),
+                      child: Row(
+                        children: [
+                          const Icon(
+                            Icons.sms_rounded,
+                            size: 14,
+                            color: Color(0xFF1D4ED8),
+                          ),
+                          const SizedBox(width: 4),
+                          FittedBox(
+                            fit: BoxFit.scaleDown,
+                            child: Text(
+                              AppStrings.t('sms_btn'),
+                              style: const TextStyle(
+                                fontSize: 11.5,
+                                fontWeight: FontWeight.bold,
+                                color: Color(0xFF1D4ED8),
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 6),
+                  ElevatedButton.icon(
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: AppColors.primaryPurple,
+                      foregroundColor: Colors.white,
+                      elevation: 0,
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 10,
+                        vertical: 6,
+                      ),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(18),
+                      ),
+                    ),
+                    onPressed: () {
+                      if (member.id == 'm2' || member.id == 'm3') {
+                        ScaffoldMessenger.of(context).showSnackBar(
+                          SnackBar(
+                            backgroundColor: AppColors.primaryPurple,
+                            behavior: SnackBarBehavior.floating,
+                            content: Text(
+                              AppStrings.t('demo_member_notice_toast'),
+                            ),
+                          ),
+                        );
+                        return;
+                      }
+                      AppEngineService.openRealMapNavigation(
+                        dest: member.location,
+                        addressHint: member.statusText,
+                      );
+                    },
+                    icon: const Icon(Icons.directions_rounded, size: 14),
+                    label: FittedBox(
+                      fit: BoxFit.scaleDown,
+                      child: Text(
+                        AppStrings.t('directions_btn'),
+                        style: const TextStyle(
+                          fontSize: 11.5,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ],
           ),
-          const SizedBox(height: 8),
-          // 🫧 Life360 버블 프라이버시 모드 스위치 카드
+
+        const SizedBox(height: 8),
+
+        // 2단: 본인일 때는 버블 프라이버시 스위치, 상대방일 때는 8종 이모지 퀵톡 바
+        if (isMe)
           Container(
             padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
             decoration: BoxDecoration(
@@ -3688,6 +3909,7 @@ class _MainLife360MapScreenState extends State<MainLife360MapScreen>
                             : AppStrings.t('bubble_mode_off_desc'),
                         style: const TextStyle(
                           fontSize: 11,
+                          height: 1.3,
                           color: AppColors.textGray,
                         ),
                       ),
@@ -3708,303 +3930,64 @@ class _MainLife360MapScreenState extends State<MainLife360MapScreen>
                       point: _allMembers[0].location,
                       battery: _allMembers[0].battery,
                       avatarUrl: _allMembers[0].avatarUrl,
+                      forceImmediate: true,
                     );
                   },
                 ),
               ],
             ),
-          ),
-          const SizedBox(height: 10),
+          )
+        else
           SingleChildScrollView(
             scrollDirection: Axis.horizontal,
+            physics: const BouncingScrollPhysics(),
             child: Row(
-              children: [
-                _buildDatePill(
-                  AppStrings.t('today'),
-                  _selectedHistoryDayTab == 0,
-                  false,
-                  () => setState(() => _selectedHistoryDayTab = 0),
-                ),
-                const SizedBox(width: 8),
-                _buildDatePill(
-                  AppStrings.t('yesterday'),
-                  _selectedHistoryDayTab == 1,
-                  !isProUser,
-                  () => setState(() => _selectedHistoryDayTab = 1),
-                ),
-                const SizedBox(width: 8),
-                _buildDatePill(
-                  AppStrings.t('days_30'),
-                  _selectedHistoryDayTab == 2,
-                  !isProUser,
-                  () => setState(() => _selectedHistoryDayTab = 2),
-                ),
-              ],
-            ),
-          ),
-          const SizedBox(height: 10),
-          Container(
-            width: double.infinity,
-            padding: const EdgeInsets.all(12),
-            decoration: BoxDecoration(
-              color: const Color(0xFFF8FAFC),
-              borderRadius: BorderRadius.circular(14),
-              border: Border.all(color: const Color(0xFFE2E8F0)),
-            ),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                if (_selectedHistoryDayTab == 0) ...[
-                  Row(
-                    children: [
-                      const Icon(
-                        Icons.route_rounded,
-                        size: 16,
-                        color: AppColors.primaryPurple,
+              children: emojiQuickNotes.map((item) {
+                final String key = item['key'] as String;
+                final bgList = item['bg'] as List;
+                final bgColors = [bgList[0] as Color, bgList[1] as Color];
+                final Color borderColor = item['border'] as Color;
+                final Color textColor = item['text'] as Color;
+                return Padding(
+                  padding: const EdgeInsets.only(right: 8.0),
+                  child: InkWell(
+                    onTap: () => _sendQuickPingToMember(member, key),
+                    borderRadius: BorderRadius.circular(22),
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 14,
+                        vertical: 8,
                       ),
-                      const SizedBox(width: 8),
-                      Expanded(
-                        child: Text(
-                          '${AppStrings.t('today')} • ${totalDistKm.toStringAsFixed(2)} km (${member.recentRoute.length} ${AppStrings.t('route_points_unit')})',
-                          style: const TextStyle(
-                            fontSize: 12.5,
-                            fontWeight: FontWeight.bold,
-                            color: AppColors.textDark,
-                          ),
+                      decoration: BoxDecoration(
+                        gradient: LinearGradient(
+                          colors: bgColors,
+                          begin: Alignment.topLeft,
+                          end: Alignment.bottomRight,
+                        ),
+                        borderRadius: BorderRadius.circular(22),
+                        border: Border.all(
+                          color: borderColor.withValues(alpha: 0.55),
+                          width: 1.3,
                         ),
                       ),
-                    ],
-                  ),
-                ] else if (_selectedHistoryDayTab == 1) ...[
-                  Text(
-                    '${AppStrings.t('yesterday')} • ${AppStrings.t('history_yesterday_sub')}',
-                    style: const TextStyle(
-                      fontSize: 12.5,
-                      fontWeight: FontWeight.bold,
-                      color: AppColors.textDark,
+                      child: Text(
+                        AppStrings.t(key),
+                        style: TextStyle(
+                          fontSize: 12.5,
+                          fontWeight: FontWeight.w800,
+                          color: textColor,
+                        ),
+                      ),
                     ),
                   ),
-                ] else ...[
-                  Text(
-                    '${AppStrings.t('days_30')} • ${AppStrings.t('history_30days_sub')}',
-                    style: const TextStyle(
-                      fontSize: 12.5,
-                      fontWeight: FontWeight.bold,
-                      color: AppColors.textDark,
-                    ),
-                  ),
-                ],
-              ],
+                );
+              }).toList(),
             ),
           ),
-        ],
-      );
-    }
 
-    // 상대방(가족/친구)을 클릭했을 때: [📞 전화] [💬 문자] [🧭 길찾기] + 파스텔 그라데이션 이모지 8종 가로 스크롤 바
-    return Column(
-      mainAxisSize: MainAxisSize.min,
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        Row(
-          mainAxisAlignment: MainAxisAlignment.spaceBetween,
-          children: [
-            Expanded(
-              child: Row(
-                children: [
-                  IconButton(
-                    visualDensity: VisualDensity.compact,
-                    icon: const Icon(
-                      Icons.arrow_back_ios_new_rounded,
-                      size: 17,
-                    ),
-                    onPressed: () => setState(() => selectedMemberId = null),
-                  ),
-                  _buildMemberAvatarImage(member, size: 32),
-                  const SizedBox(width: 8),
-                  Flexible(
-                    child: Text(
-                      member.name,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(
-                        fontSize: 16,
-                        fontWeight: FontWeight.w900,
-                        color: AppColors.textDark,
-                      ),
-                    ),
-                  ),
-                ],
-              ),
-            ),
-            Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                // 📞 스마트폰 기본 전화 직통 버튼
-                InkWell(
-                  onTap: () => _handleMemberPhoneAction(
-                    member: member,
-                    isCall: true,
-                  ),
-                  borderRadius: BorderRadius.circular(20),
-                  child: Container(
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 10,
-                      vertical: 6,
-                    ),
-                    decoration: BoxDecoration(
-                      color: const Color(0xFFD1FAE5),
-                      borderRadius: BorderRadius.circular(18),
-                      border: Border.all(color: const Color(0xFF10B981)),
-                    ),
-                    child: Row(
-                      children: [
-                        const Icon(
-                          Icons.call_rounded,
-                          size: 14,
-                          color: Color(0xFF047857),
-                        ),
-                        const SizedBox(width: 4),
-                        Text(
-                          AppStrings.t('call_btn'),
-                          style: const TextStyle(
-                            fontSize: 11.5,
-                            fontWeight: FontWeight.bold,
-                            color: Color(0xFF047857),
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-                ),
-                const SizedBox(width: 6),
-                // 💬 스마트폰 기본 문자 직통 버튼
-                InkWell(
-                  onTap: () => _handleMemberPhoneAction(
-                    member: member,
-                    isCall: false,
-                  ),
-                  borderRadius: BorderRadius.circular(20),
-                  child: Container(
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 10,
-                      vertical: 6,
-                    ),
-                    decoration: BoxDecoration(
-                      color: const Color(0xFFDBEAFE),
-                      borderRadius: BorderRadius.circular(18),
-                      border: Border.all(color: const Color(0xFF3B82F6)),
-                    ),
-                    child: Row(
-                      children: [
-                        const Icon(
-                          Icons.sms_rounded,
-                          size: 14,
-                          color: Color(0xFF1D4ED8),
-                        ),
-                        const SizedBox(width: 4),
-                        Text(
-                          AppStrings.t('sms_btn'),
-                          style: const TextStyle(
-                            fontSize: 11.5,
-                            fontWeight: FontWeight.bold,
-                            color: Color(0xFF1D4ED8),
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-                ),
-                const SizedBox(width: 6),
-                // 🧭 내비게이션 길찾기 버튼
-                ElevatedButton.icon(
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: AppColors.primaryPurple,
-                    foregroundColor: Colors.white,
-                    elevation: 0,
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 10,
-                      vertical: 6,
-                    ),
-                    shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(18),
-                    ),
-                  ),
-                  onPressed: () {
-                    AppEngineService.openRealMapNavigation(
-                      dest: member.location,
-                      addressHint: member.statusText,
-                    );
-                  },
-                  icon: const Icon(Icons.directions_rounded, size: 14),
-                  label: Text(
-                    AppStrings.t('directions_btn'),
-                    style: const TextStyle(
-                      fontSize: 11.5,
-                      fontWeight: FontWeight.bold,
-                    ),
-                  ),
-                ),
-              ],
-            ),
-          ],
-        ),
         const SizedBox(height: 10),
-        // ✨ Life360을 뛰어넘는 좌우 스크롤 파스텔 그라데이션 이모지 퀵 노트 8종 바
-        SingleChildScrollView(
-          scrollDirection: Axis.horizontal,
-          physics: const BouncingScrollPhysics(),
-          child: Row(
-            children: emojiQuickNotes.map((item) {
-              final String key = item['key'] as String;
-              final bgList = item['bg'] as List;
-              final bgColors = [bgList[0] as Color, bgList[1] as Color];
-              final Color borderColor = item['border'] as Color;
-              final Color textColor = item['text'] as Color;
-              return Padding(
-                padding: const EdgeInsets.only(right: 8.0),
-                child: InkWell(
-                  onTap: () => _sendQuickPingToMember(member, key),
-                  borderRadius: BorderRadius.circular(22),
-                  child: Container(
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 14,
-                      vertical: 8,
-                    ),
-                    decoration: BoxDecoration(
-                      gradient: LinearGradient(
-                        colors: bgColors,
-                        begin: Alignment.topLeft,
-                        end: Alignment.bottomRight,
-                      ),
-                      borderRadius: BorderRadius.circular(22),
-                      border: Border.all(
-                        color: borderColor.withValues(alpha: 0.55),
-                        width: 1.3,
-                      ),
-                      boxShadow: [
-                        BoxShadow(
-                          color: borderColor.withValues(alpha: 0.16),
-                          blurRadius: 6,
-                          offset: const Offset(0, 2),
-                        ),
-                      ],
-                    ),
-                    child: Text(
-                      AppStrings.t(key),
-                      style: TextStyle(
-                        fontSize: 12.5,
-                        fontWeight: FontWeight.w800,
-                        color: textColor,
-                      ),
-                    ),
-                  ),
-                ),
-              );
-            }).toList(),
-          ),
-        ),
-        const SizedBox(height: 12),
+
+        // 3단: 나 & 가족 공통 [오늘(무료) | 어제(무료) | 👑 30일 기록(Pro)] 탭
         SingleChildScrollView(
           scrollDirection: Axis.horizontal,
           child: Row(
@@ -4013,97 +3996,219 @@ class _MainLife360MapScreenState extends State<MainLife360MapScreen>
                 AppStrings.t('today'),
                 _selectedHistoryDayTab == 0,
                 false,
-                () => setState(() => _selectedHistoryDayTab = 0),
+                () => switchTimelineTab(0),
               ),
               const SizedBox(width: 8),
               _buildDatePill(
                 AppStrings.t('yesterday'),
                 _selectedHistoryDayTab == 1,
-                !isProUser,
-                () => setState(() => _selectedHistoryDayTab = 1),
+                false,
+                () => switchTimelineTab(1),
               ),
               const SizedBox(width: 8),
               _buildDatePill(
-                AppStrings.t('days_30'),
+                '👑 ${AppStrings.t('days_30')}',
                 _selectedHistoryDayTab == 2,
-                !isProUser,
-                () => setState(() => _selectedHistoryDayTab = 2),
+                false,
+                () => switchTimelineTab(2),
               ),
-              const SizedBox(width: 10),
-              _buildSmartMotionBadge(member),
+              if (!isMe) ...[
+                const SizedBox(width: 10),
+                _buildSmartMotionBadge(member),
+              ],
             ],
           ),
         ),
+
         const SizedBox(height: 10),
+
+        // 4단: 날짜별 실제 타임라인 상세 박스 (30일 탭 선택 시 Pro 수익화 잠금 게이트 작동)
         Container(
+          width: double.infinity,
           padding: const EdgeInsets.all(12),
           decoration: BoxDecoration(
             color: const Color(0xFFF8FAFC),
             borderRadius: BorderRadius.circular(14),
             border: Border.all(color: const Color(0xFFE2E8F0)),
           ),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Row(
-                children: [
-                  const Icon(
-                    Icons.place_rounded,
-                    size: 16,
-                    color: AppColors.primaryPurple,
-                  ),
-                  const SizedBox(width: 8),
-                  Expanded(
-                    child: Text(
-                      '$tNow • $cleanAddr',
-                      style: const TextStyle(
-                        fontSize: 12.5,
-                        fontWeight: FontWeight.bold,
-                        color: AppColors.textDark,
-                      ),
+          child: _selectedHistoryDayTab == 2 && !isProUser
+              ? Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        const Icon(
+                          Icons.workspace_premium_rounded,
+                          size: 18,
+                          color: AppColors.primaryPurple,
+                        ),
+                        const SizedBox(width: 6),
+                        Expanded(
+                          child: Text(
+                            AppStrings.t('pro_30d_tease_title'),
+                            style: const TextStyle(
+                              fontSize: 13,
+                              fontWeight: FontWeight.w900,
+                              color: AppColors.textDark,
+                            ),
+                          ),
+                        ),
+                        Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 8,
+                            vertical: 3,
+                          ),
+                          decoration: BoxDecoration(
+                            color: const Color(0xFFEDE9FE),
+                            borderRadius: BorderRadius.circular(10),
+                          ),
+                          child: Text(
+                            '${tabDistKm.toStringAsFixed(1)} km • ${activeTabRoute.length} pts',
+                            style: const TextStyle(
+                              fontSize: 11,
+                              fontWeight: FontWeight.bold,
+                              color: AppColors.primaryPurple,
+                            ),
+                          ),
+                        ),
+                      ],
                     ),
-                  ),
-                ],
-              ),
-              const Padding(
-                padding: EdgeInsets.only(left: 7, top: 2, bottom: 2),
-                child: SizedBox(
-                  height: 10,
-                  child: VerticalDivider(
-                    width: 2,
-                    thickness: 1.5,
-                    color: Color(0xFFCBD5E1),
-                  ),
-                ),
-              ),
-              Row(
-                children: [
-                  const Icon(
-                    Icons.directions_walk_rounded,
-                    size: 15,
-                    color: AppColors.safeGreenText,
-                  ),
-                  const SizedBox(width: 8),
-                  Expanded(
-                    child: Text(
-                      member.recentRoute.length > 1
-                          ? '$tPrev1 ~ $tNow • ${totalDistKm.toStringAsFixed(2)}km (${member.speedKmh.toStringAsFixed(1)}km/h)'
-                          : '$tPrev2 ~ $tNow • ${AppStrings.t('status_staying')}',
+                    const SizedBox(height: 6),
+                    Text(
+                      AppStrings.t('pro_30d_tease_desc'),
                       style: const TextStyle(
                         fontSize: 11.5,
-                        fontWeight: FontWeight.w600,
+                        height: 1.35,
                         color: AppColors.textGray,
                       ),
                     ),
-                  ),
-                ],
-              ),
-            ],
-          ),
+                    const SizedBox(height: 10),
+                    SizedBox(
+                      width: double.infinity,
+                      child: ElevatedButton.icon(
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: AppColors.primaryPurple,
+                          foregroundColor: Colors.white,
+                          padding: const EdgeInsets.symmetric(vertical: 10),
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(12),
+                          ),
+                        ),
+                        onPressed: _showProPaywallSheet,
+                        icon: const Icon(Icons.lock_open_rounded, size: 16),
+                        label: FittedBox(
+                          fit: BoxFit.scaleDown,
+                          child: Text(
+                            AppStrings.t('pro_unlock_btn'),
+                            style: const TextStyle(
+                              fontSize: 12.5,
+                              fontWeight: FontWeight.bold,
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ],
+                )
+              : (_selectedHistoryDayTab == 1 && activeTabRoute.isEmpty)
+                  ? Row(
+                      children: [
+                        const Icon(
+                          Icons.history_toggle_off_rounded,
+                          size: 16,
+                          color: AppColors.textGray,
+                        ),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: Text(
+                            AppStrings.t('timeline_empty_yesterday'),
+                            style: const TextStyle(
+                              fontSize: 12,
+                              fontWeight: FontWeight.w600,
+                              color: AppColors.textGray,
+                            ),
+                          ),
+                        ),
+                      ],
+                    )
+                  : Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Row(
+                          children: [
+                            const Icon(
+                              Icons.route_rounded,
+                              size: 16,
+                              color: AppColors.primaryPurple,
+                            ),
+                            const SizedBox(width: 8),
+                            Expanded(
+                              child: Text(
+                                '${AppStrings.t('timeline_total_dist')} ${tabDistKm.toStringAsFixed(2)} km • ${AppStrings.t('timeline_max_speed')} ${tabMaxSpeed.toStringAsFixed(0)} km/h • ${activeTabRoute.length} ${AppStrings.t('route_points_unit')}',
+                                style: const TextStyle(
+                                  fontSize: 12,
+                                  fontWeight: FontWeight.bold,
+                                  color: AppColors.textDark,
+                                ),
+                              ),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 8),
+                        Row(
+                          children: [
+                            const Icon(
+                              Icons.place_rounded,
+                              size: 15,
+                              color: AppColors.primaryPurple,
+                            ),
+                            const SizedBox(width: 8),
+                            Expanded(
+                              child: Text(
+                                '$tNow • $cleanAddr',
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: const TextStyle(
+                                  fontSize: 12,
+                                  fontWeight: FontWeight.w700,
+                                  color: AppColors.textDark,
+                                ),
+                              ),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 4),
+                        Row(
+                          children: [
+                            const Icon(
+                              Icons.directions_walk_rounded,
+                              size: 15,
+                              color: AppColors.safeGreenText,
+                            ),
+                            const SizedBox(width: 8),
+                            Expanded(
+                              child: Text(
+                                activeTabRoute.length > 1
+                                    ? '$tPrev1 ~ $tNow • ${tabDistKm.toStringAsFixed(2)} km (${member.speedKmh.toStringAsFixed(1)} km/h)'
+                                    : '$tPrev1 ~ $tNow • ${AppStrings.t('status_staying')}',
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: const TextStyle(
+                                  fontSize: 11.5,
+                                  fontWeight: FontWeight.w600,
+                                  color: AppColors.textGray,
+                                ),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ],
+                    ),
         ),
       ],
     );
   }
+
   Widget _buildDatePill(
     String label,
     bool active,
@@ -4119,13 +4224,17 @@ class _MainLife360MapScreenState extends State<MainLife360MapScreen>
           borderRadius: BorderRadius.circular(20),
         ),
         child: Row(
+          mainAxisSize: MainAxisSize.min,
           children: [
-            Text(
-              label,
-              style: TextStyle(
-                fontSize: 12,
-                fontWeight: FontWeight.bold,
-                color: active ? Colors.white : AppColors.textGray,
+            FittedBox(
+              fit: BoxFit.scaleDown,
+              child: Text(
+                label,
+                style: TextStyle(
+                  fontSize: 12,
+                  fontWeight: FontWeight.bold,
+                  color: active ? Colors.white : AppColors.textGray,
+                ),
               ),
             ),
             if (locked) ...[

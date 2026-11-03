@@ -1119,6 +1119,21 @@ class AppStrings {
   };
 
       static const Map<String, String> _koMasterOverride = {
+    'bubble_masked_addr': '🫧 버블 프라이버시 보호 중 (반경 500m 대략적 위치)',
+    'invite_auto_msg': '📍 [Pingo] 실시간 위치 공유 서클에 초대합니다!\n초대 코드: [{CODE}]\n아래 링크에서 바로 위치를 확인하거나 앱에서 코드를 입력해 합류하세요:\n{LINK}',
+    'my_phone_hint': '내 전화번호 입력 (가족 간 바로 통화·문자 연결용)',
+    'place_arrived_alert': '📍 {PLACE} 안심 존에 도착했습니다',
+    'place_left_alert': '🚶 {PLACE} 안심 존에서 출발했습니다',
+    'share_circle_banner': '서클 초대 코드 복사 및 가족 초대하기',
+    'share_messenger_btn': '카카오톡 · 문자 · 메신저로 초대장 보내기',
+    'sos_cleared_toast': '✅ SOS 긴급 구조 요청이 해제되었습니다.',
+    'timeline_empty_yesterday': '어제 기록된 이동 경로가 없습니다 (오늘부터 자동 기록됩니다)',
+    'timeline_points_label': '경유 지점',
+    'timeline_max_speed': '최고 속도',
+    'timeline_total_dist': '총 이동 거리',
+    'pro_30d_tease_title': '👑 최근 30일 누적 타임라인 & 방문 기록',
+    'pro_30d_tease_desc': 'Pingo Pro로 업그레이드하고 나와 가족의 최근 30일 전체 이동 동선과 체류 시간표를 제한 없이 확인하세요.',
+    'pro_unlock_btn': '👑 Pro 패스로 30일 전체 기록 잠금 해제',
     'my_timeline_btn': '내 이동 타임라인 보기',
     'bubble_mode_title': '버블 프라이버시 모드 (반경 600m 보호)',
     'bubble_mode_on_desc': '현재 내 상세 위치가 보호되어 서클 멤버에게 반경 600m 대략적 구역만 표시됩니다.',
