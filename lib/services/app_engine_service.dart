@@ -3,6 +3,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math' as math;
+
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
@@ -11,6 +12,7 @@ import 'package:in_app_purchase/in_app_purchase.dart';
 import 'package:latlong2/latlong.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import 'package:url_launcher/url_launcher.dart';
+
 import '../core/app_theme_and_strings.dart';
 import '../models/app_models.dart';
 
@@ -211,8 +213,9 @@ class AppEngineService {
 
   Future<void> _loadPersistentTimelineHistory() async {
     try {
-      final rawJson =
-          await _readPersistentText('pingo_timeline_history_v3.json');
+      final rawJson = await _readPersistentText(
+        'pingo_timeline_history_v3.json',
+      );
       if (rawJson.isNotEmpty) {
         final decoded = jsonDecode(rawJson) as Map<String, dynamic>;
         final cutoff = DateTime.now().subtract(const Duration(days: 31));
@@ -238,16 +241,18 @@ class AppEngineService {
           }
         });
       }
-      final rawSpd =
-          await _readPersistentText('pingo_timeline_maxspeed_v3.json');
+      final rawSpd = await _readPersistentText(
+        'pingo_timeline_maxspeed_v3.json',
+      );
       if (rawSpd.isNotEmpty) {
         final decodedSpd = jsonDecode(rawSpd) as Map<String, dynamic>;
         decodedSpd.forEach((k, v) {
           if (v is num) myDailyMaxSpeed[k] = v.toDouble();
         });
       }
-      final rawRemote =
-          await _readPersistentText('pingo_remote_timelines_v3.json');
+      final rawRemote = await _readPersistentText(
+        'pingo_remote_timelines_v3.json',
+      );
       if (rawRemote.isNotEmpty) {
         final decodedRem = jsonDecode(rawRemote) as Map<String, dynamic>;
         decodedRem.forEach((uid, dayMap) {
@@ -277,36 +282,138 @@ class AppEngineService {
     } catch (_) {}
   }
 
+  bool isDummyOrInvalidPoint(LatLng p) {
+    if (p.latitude == 0.0 && p.longitude == 0.0) return true;
+    return (p.latitude - 37.7599).abs() < 0.0005 &&
+        (p.longitude - 126.7802).abs() < 0.0005;
+  }
+
+  List<LatLng> simplifyRouteRDP(
+    List<LatLng> points, {
+    double epsilonDegrees = 0.00015,
+    int maxPoints = 85,
+  }) {
+    final clean = points.where((p) => !isDummyOrInvalidPoint(p)).toList();
+    if (clean.length <= 3) return List<LatLng>.from(clean);
+
+    List<LatLng> rdpRecursive(List<LatLng> pts, double eps) {
+      if (pts.length < 3) return pts;
+      double dmax = 0.0;
+      int index = 0;
+      final LatLng start = pts.first;
+      final LatLng end = pts.last;
+
+      for (int i = 1; i < pts.length - 1; i++) {
+        final double d = _perpendicularDistance(pts[i], start, end);
+        if (d > dmax) {
+          index = i;
+          dmax = d;
+        }
+      }
+
+      if (dmax > eps) {
+        final rec1 = rdpRecursive(pts.sublist(0, index + 1), eps);
+        final rec2 = rdpRecursive(pts.sublist(index), eps);
+        return <LatLng>[...rec1.sublist(0, rec1.length - 1), ...rec2];
+      } else {
+        return <LatLng>[start, end];
+      }
+    }
+
+    var result = rdpRecursive(clean, epsilonDegrees);
+    double currentEps = epsilonDegrees;
+    while (result.length > maxPoints && result.length > 6) {
+      currentEps *= 1.45;
+      result = rdpRecursive(result, currentEps);
+    }
+    return result;
+  }
+
+  double _perpendicularDistance(LatLng pt, LatLng lineStart, LatLng lineEnd) {
+    final double dx = lineEnd.longitude - lineStart.longitude;
+    final double dy = lineEnd.latitude - lineStart.latitude;
+    final double mag = math.sqrt(dx * dx + dy * dy);
+    if (mag < 1e-9) {
+      final double px = pt.longitude - lineStart.longitude;
+      final double py = pt.latitude - lineStart.latitude;
+      return math.sqrt(px * px + py * py);
+    }
+    final double u =
+        (((pt.longitude - lineStart.longitude) * dx) +
+            ((pt.latitude - lineStart.latitude) * dy)) /
+        (mag * mag);
+    final double ix = lineStart.longitude + u * dx;
+    final double iy = lineStart.latitude + u * dy;
+    final double distX = pt.longitude - ix;
+    final double distY = pt.latitude - iy;
+    return math.sqrt(distX * distX + distY * distY);
+  }
+
   Future<List<LatLng>> recordMyLocationBreadcrumb(
     LatLng point, {
     double speedKmh = 0.0,
   }) async {
     final tKey = todayKey;
-    final list = myDailyRoutes.putIfAbsent(tKey, () => <LatLng>[]);
+    myDailyRoutes.forEach((k, pts) {
+      pts.removeWhere(isDummyOrInvalidPoint);
+    });
+
+    if (isDummyOrInvalidPoint(point)) {
+      return List<LatLng>.from(myDailyRoutes[tKey] ?? <LatLng>[]);
+    }
+
+    final list = myDailyRoutes.putIfAbsent(tKey, () {
+      final yList = myDailyRoutes[yesterdayKey];
+      if (yList != null &&
+          yList.isNotEmpty &&
+          !isDummyOrInvalidPoint(yList.last)) {
+        return <LatLng>[yList.last];
+      }
+      return <LatLng>[];
+    });
+
     if (list.isEmpty) {
       list.add(point);
     } else {
       final dist = calculateDistanceMeters(list.last, point);
-      if (dist >= 12.0) {
+      if (dist >= 10.0 && dist <= 15000.0) {
         list.add(point);
-        if (list.length > 250) list.removeAt(0);
+      } else if (dist > 15000.0 && list.length <= 2) {
+        list
+          ..clear()
+          ..add(point);
+      }
+      if (list.length > 1500) {
+        final compacted = simplifyRouteRDP(
+          list,
+          epsilonDegrees: 0.00008,
+          maxPoints: 1200,
+        );
+        list
+          ..clear()
+          ..addAll(compacted);
       }
     }
+
     final prevMax = myDailyMaxSpeed[tKey] ?? 0.0;
     if (speedKmh > prevMax) {
       myDailyMaxSpeed[tKey] = speedKmh;
     }
+
     try {
       final serialized = <String, dynamic>{};
       myDailyRoutes.forEach((k, v) {
-        serialized[k] = v
-            .map(
-              (p) => [
-                double.parse(p.latitude.toStringAsFixed(5)),
-                double.parse(p.longitude.toStringAsFixed(5)),
-              ],
-            )
-            .toList();
+        final validPts = v.where((p) => !isDummyOrInvalidPoint(p)).toList();
+        if (validPts.isNotEmpty) {
+          serialized[k] = validPts
+              .map(
+                (p) => [
+                  double.parse(p.latitude.toStringAsFixed(5)),
+                  double.parse(p.longitude.toStringAsFixed(5)),
+                ],
+              )
+              .toList();
+        }
       });
       await _writePersistentText(
         'pingo_timeline_history_v3.json',
@@ -320,49 +427,315 @@ class AppEngineService {
     return List<LatLng>.from(list);
   }
 
+  final Map<String, List<LatLng>> _snappedRoadCache = {};
+  final Set<String> _pendingRoadSnapKeys = {};
+  final Set<String> _pendingGeocodeKeys = {};
+  void Function()? onTimelineMetaUpdated;
+
   List<LatLng> getRouteForMemberTab(
     String memberId,
     int tabIndex,
-    LatLng fallbackLoc,
-  ) {
+    LatLng fallbackLoc, {
+    String? customDateKey,
+  }) {
     final isMe = memberId == 'm1' || memberId == currentUserId;
-    if (isMe) {
+    final sourceMap = isMe ? myDailyRoutes : memberDailyRoutes[memberId];
+
+    List<LatLng> rawWaypoints = <LatLng>[];
+
+    if ((memberId == 'm2' || memberId == 'm3') &&
+        (sourceMap == null || sourceMap.isEmpty)) {
+      final base = isDummyOrInvalidPoint(fallbackLoc)
+          ? const LatLng(37.2636, 127.0286)
+          : fallbackLoc;
       if (tabIndex == 0) {
-        final r = myDailyRoutes[todayKey];
-        return (r != null && r.isNotEmpty)
-            ? List<LatLng>.from(r)
-            : [fallbackLoc];
-      } else if (tabIndex == 1) {
-        final r = myDailyRoutes[yesterdayKey];
-        return (r != null && r.isNotEmpty) ? List<LatLng>.from(r) : <LatLng>[];
+        rawWaypoints = <LatLng>[
+          LatLng(base.latitude - 0.0048, base.longitude - 0.0036),
+          LatLng(base.latitude - 0.0022, base.longitude - 0.0029),
+          LatLng(base.latitude - 0.0009, base.longitude - 0.0011),
+          base,
+        ];
       } else {
-        final all = <LatLng>[];
-        final sortedKeys = myDailyRoutes.keys.toList()..sort();
-        for (final k in sortedKeys) {
-          all.addAll(myDailyRoutes[k]!);
-        }
-        return all.isNotEmpty ? all : [fallbackLoc];
+        rawWaypoints = <LatLng>[
+          LatLng(base.latitude + 0.0052, base.longitude - 0.0038),
+          LatLng(base.latitude + 0.0028, base.longitude - 0.0014),
+          LatLng(base.latitude + 0.0012, base.longitude + 0.0019),
+          base,
+        ];
       }
+    } else if (sourceMap == null) {
+      rawWaypoints = isDummyOrInvalidPoint(fallbackLoc)
+          ? <LatLng>[]
+          : <LatLng>[fallbackLoc];
+    } else if (customDateKey != null && customDateKey.isNotEmpty) {
+      final r = sourceMap[customDateKey];
+      rawWaypoints = r == null
+          ? <LatLng>[]
+          : r.where((p) => !isDummyOrInvalidPoint(p)).toList();
+    } else if (tabIndex == 0) {
+      final r = sourceMap[todayKey];
+      final valid = r == null
+          ? <LatLng>[]
+          : r.where((p) => !isDummyOrInvalidPoint(p)).toList();
+      rawWaypoints = valid.isNotEmpty
+          ? valid
+          : (isDummyOrInvalidPoint(fallbackLoc)
+                ? <LatLng>[]
+                : <LatLng>[fallbackLoc]);
+    } else if (tabIndex == 1) {
+      final r = sourceMap[yesterdayKey];
+      rawWaypoints = r == null
+          ? <LatLng>[]
+          : r.where((p) => !isDummyOrInvalidPoint(p)).toList();
     } else {
-      final mMap = memberDailyRoutes[memberId];
-      if (mMap == null) return tabIndex == 0 ? [fallbackLoc] : <LatLng>[];
-      if (tabIndex == 0) {
-        final r = mMap[todayKey];
-        return (r != null && r.isNotEmpty)
-            ? List<LatLng>.from(r)
-            : [fallbackLoc];
-      } else if (tabIndex == 1) {
-        final r = mMap[yesterdayKey];
-        return (r != null && r.isNotEmpty) ? List<LatLng>.from(r) : <LatLng>[];
-      } else {
-        final all = <LatLng>[];
-        final sortedKeys = mMap.keys.toList()..sort();
-        for (final k in sortedKeys) {
-          all.addAll(mMap[k]!);
+      final sortedKeys = sourceMap.keys.toList()..sort();
+      for (int i = sortedKeys.length - 1; i >= 0; i--) {
+        final raw = sourceMap[sortedKeys[i]];
+        if (raw == null) continue;
+        final pts = raw.where((p) => !isDummyOrInvalidPoint(p)).toList();
+        if (pts.isNotEmpty) {
+          rawWaypoints = pts;
+          break;
         }
-        return all.isNotEmpty ? all : [fallbackLoc];
+      }
+      if (rawWaypoints.isEmpty && !isDummyOrInvalidPoint(fallbackLoc)) {
+        rawWaypoints = <LatLng>[fallbackLoc];
       }
     }
+
+    if (rawWaypoints.length < 2) return rawWaypoints;
+
+    final String cacheKey =
+        '${memberId}_${tabIndex}_${customDateKey ?? ""}_${rawWaypoints.length}_${rawWaypoints.first.latitude.toStringAsFixed(4)}_${rawWaypoints.last.latitude.toStringAsFixed(4)}';
+
+    if (_snappedRoadCache.containsKey(cacheKey)) {
+      return _snappedRoadCache[cacheKey]!;
+    }
+
+    if (!_pendingRoadSnapKeys.contains(cacheKey)) {
+      _pendingRoadSnapKeys.add(cacheKey);
+      fetchRoadSnappedRoute(rawWaypoints).then((snapped) {
+        if (snapped.length >= 2) {
+          _snappedRoadCache[cacheKey] = snapped;
+          onTimelineMetaUpdated?.call();
+        }
+      });
+    }
+
+    return rawWaypoints;
+  }
+
+  String resolvePlaceOrPoiName(
+    LatLng point, {
+    List<SafePlaceData>? safePlaces,
+  }) {
+    if (safePlaces != null) {
+      for (final sp in safePlaces) {
+        final d = calculateDistanceMeters(point, sp.point);
+        if (d <= math.max(sp.radiusMeters, 120.0)) {
+          return sp.name;
+        }
+      }
+    }
+    final key =
+        '${point.latitude.toStringAsFixed(3)}_${point.longitude.toStringAsFixed(3)}';
+    final cached = _roadAddressCache[key];
+    if (cached != null && cached.isNotEmpty) {
+      return cached;
+    }
+    if (!_pendingGeocodeKeys.contains(key)) {
+      _pendingGeocodeKeys.add(key);
+      _fetchPoiOrRoadNameInBackground(point, key);
+    }
+    return '${point.latitude.toStringAsFixed(4)}, ${point.longitude.toStringAsFixed(4)}';
+  }
+
+  Future<void> _fetchPoiOrRoadNameInBackground(
+    LatLng point,
+    String cacheKey,
+  ) async {
+    const token =
+        'pk.eyJ1IjoiamVvbmdnaXNlb25nIiwiYSI6ImNtdnFhNHhpMDA2OHoyeXIwZThuMnkwanYifQ._Zouj-a9d2NaLWCVyRKwiQ';
+    final langCode = AppStrings.lang;
+    final url = Uri.parse(
+      'https://api.mapbox.com/geocoding/v5/mapbox.places/${point.longitude},${point.latitude}.json'
+      '?types=poi,address,neighborhood,locality&language=$langCode&limit=1&access_token=$token',
+    );
+    try {
+      final res = await http.get(url).timeout(const Duration(seconds: 4));
+      if (res.statusCode == 200) {
+        final data = jsonDecode(res.body);
+        final features = data['features'] as List?;
+        if (features != null && features.isNotEmpty) {
+          final f = features.first;
+          final placeText = (f['text'] ?? '').toString().trim();
+          String contextStr = '';
+          final ctxList = f['context'] as List?;
+          if (ctxList != null && ctxList.isNotEmpty) {
+            contextStr = (ctxList.first['text'] ?? '').toString().trim();
+          }
+          final label = (contextStr.isNotEmpty && contextStr != placeText)
+              ? '$contextStr $placeText'
+              : placeText;
+          if (label.isNotEmpty) {
+            _roadAddressCache[cacheKey] = label;
+            onTimelineMetaUpdated?.call();
+            return;
+          }
+        }
+      }
+    } catch (_) {}
+  }
+
+  List getThirtyDaysDailyBreakdown(
+    String memberId,
+    LatLng fallbackLoc, {
+    List<SafePlaceData>? safePlaces,
+  }) {
+    final isMe = memberId == 'm1' || memberId == currentUserId;
+    final sourceMap = isMe ? myDailyRoutes : memberDailyRoutes[memberId];
+    final result = [];
+
+    if (sourceMap != null) {
+      final keys = sourceMap.keys.toList()..sort((a, b) => b.compareTo(a));
+      for (final k in keys) {
+        final rawPts = sourceMap[k];
+        if (rawPts == null) continue;
+        final pts = rawPts.where((p) => !isDummyOrInvalidPoint(p)).toList();
+        if (pts.isEmpty) continue;
+        final distKm = computeRouteDistanceKm(pts);
+        final steps = buildDetailedTimelineSteps(pts, safePlaces: safePlaces);
+        final placesCnt = steps.length;
+        final mins = pts.length < 2
+            ? 0
+            : (distKm * 6.5 + placesCnt * 4).round();
+        result.add({
+          'dateKey': k,
+          'points': pts,
+          'distanceKm': distKm,
+          'placesCount': placesCnt,
+          'minutes': mins,
+        });
+      }
+    }
+
+    if (result.isEmpty && (memberId == 'm2' || memberId == 'm3')) {
+      final now = DateTime.now();
+      for (int d = 0; d < 5; d++) {
+        final dt = now.subtract(Duration(days: d));
+        final dk =
+            '${dt.year}-${dt.month.toString().padLeft(2, '0')}-${dt.day.toString().padLeft(2, '0')}';
+        final demoPts = getRouteForMemberTab(
+          memberId,
+          d == 0 ? 0 : 1,
+          fallbackLoc,
+        );
+        final distKm = computeRouteDistanceKm(demoPts);
+        final steps = buildDetailedTimelineSteps(
+          demoPts,
+          safePlaces: safePlaces,
+        );
+        result.add({
+          'dateKey': dk,
+          'points': demoPts,
+          'distanceKm': distKm,
+          'placesCount': steps.length,
+          'minutes': (distKm * 8).round().clamp(15, 240),
+        });
+      }
+    }
+    return result;
+  }
+
+  List buildDetailedTimelineSteps(
+    List<LatLng> validRoute, {
+    List<SafePlaceData>? safePlaces,
+  }) {
+    if (validRoute.isEmpty) return [];
+    if (validRoute.length == 1) {
+      final placeName = resolvePlaceOrPoiName(
+        validRoute.first,
+        safePlaces: safePlaces,
+      );
+      return [
+        {
+          'type': 'end',
+          'point': validRoute.first,
+          'placeName': placeName,
+          'segmentKm': 0.0,
+          'progressRatio': 1.0,
+        },
+      ];
+    }
+
+    // 1단계: 하루 외근/장거리 이동 시에도 실제 방문 거점이 누락되지 않도록 상한을 40곳으로 확장
+    final rdpCandidates = simplifyRouteRDP(
+      validRoute,
+      epsilonDegrees: 0.00042,
+      maxPoints: 40,
+    );
+
+    // 2단계: 단순 신호대기/골목 코너 중복을 걸러내는 160m 공간 클러스터링
+    final keyNodes = [rdpCandidates.first];
+    for (int i = 1; i < rdpCandidates.length - 1; i++) {
+      final distFromPrev = calculateDistanceMeters(
+        keyNodes.last,
+        rdpCandidates[i],
+      );
+      final distToEnd = calculateDistanceMeters(
+        rdpCandidates[i],
+        rdpCandidates.last,
+      );
+      if (distFromPrev >= 160.0 && distToEnd >= 160.0) {
+        keyNodes.add(rdpCandidates[i]);
+      }
+    }
+    if (calculateDistanceMeters(keyNodes.last, rdpCandidates.last) >= 60.0 ||
+        keyNodes.length == 1) {
+      keyNodes.add(rdpCandidates.last);
+    }
+
+    // 3단계: 역지오코딩 주소 변환 + 직전 방문지와 주소/건물명이 동일하면 1곳으로 자동 병합(Merge)
+    final mergedSteps = [];
+    for (int i = 0; i < keyNodes.length; i++) {
+      final pt = keyNodes[i];
+      final placeName = resolvePlaceOrPoiName(pt, safePlaces: safePlaces);
+      double segKm = 0.0;
+      if (i > 0) {
+        segKm = calculateDistanceMeters(keyNodes[i - 1], pt) / 1000.0;
+      }
+
+      final bool isCoordinateFallback =
+          placeName.contains(',') &&
+          RegExp(r'^\d+\.\d+').hasMatch(placeName.trim());
+
+      if (mergedSteps.isNotEmpty &&
+          !isCoordinateFallback &&
+          mergedSteps.last['placeName'] == placeName) {
+        mergedSteps.last['segmentKm'] =
+            (mergedSteps.last['segmentKm'] as double) + segKm;
+        mergedSteps.last['point'] = pt;
+      } else {
+        mergedSteps.add({
+          'type': 'waypoint',
+          'point': pt,
+          'placeName': placeName,
+          'segmentKm': segKm,
+          'progressRatio': 0.0,
+        });
+      }
+    }
+
+    // 4단계: 시작점(start) / 경유점(waypoint) / 도착점(end) 타입 및 진행률 확정
+    final int total = mergedSteps.length;
+    for (int i = 0; i < total; i++) {
+      mergedSteps[i]['type'] = i == 0
+          ? 'start'
+          : (i == total - 1 ? 'end' : 'waypoint');
+      mergedSteps[i]['progressRatio'] = total <= 1 ? 1.0 : i / (total - 1);
+    }
+
+    return mergedSteps;
   }
 
   double computeRouteDistanceKm(List<LatLng> pts) {
@@ -400,35 +773,42 @@ class AppEngineService {
   String _encodeMyCompactRouteMeta() {
     List<List<double>> compress(List<LatLng>? src, int maxPts) {
       if (src == null || src.isEmpty) return [];
-      if (src.length <= maxPts) {
-        return src
-            .map(
-              (p) => [
-                double.parse(p.latitude.toStringAsFixed(4)),
-                double.parse(p.longitude.toStringAsFixed(4)),
-              ],
-            )
-            .toList();
-      }
-      final step = (src.length - 1) / (maxPts - 1);
-      final out = <List<double>>[];
-      for (int i = 0; i < maxPts; i++) {
-        final pt = src[(i * step).round().clamp(0, src.length - 1)];
-        out.add([
-          double.parse(pt.latitude.toStringAsFixed(4)),
-          double.parse(pt.longitude.toStringAsFixed(4)),
-        ]);
-      }
-      return out;
+      // 등간격 삭제(직선화 원인) 대신 RDP 도로 굴곡(코너 꼭짓점) 보존 압축 적용!
+      final simplified = simplifyRouteRDP(
+        src,
+        epsilonDegrees: 0.00015,
+        maxPoints: maxPts,
+      );
+      return simplified
+          .map(
+            (p) => [
+              double.parse(p.latitude.toStringAsFixed(5)),
+              double.parse(p.longitude.toStringAsFixed(5)),
+            ],
+          )
+          .toList();
+    }
+
+    final histMap = <String, dynamic>{};
+    final sortedKeys = myDailyRoutes.keys.toList()..sort();
+    for (final k in sortedKeys.reversed.take(14)) {
+      if (k == todayKey || k == yesterdayKey) continue;
+      final cPts = compress(myDailyRoutes[k], 24);
+      if (cPts.isNotEmpty) histMap[k] = cPts;
     }
 
     final map = <String, dynamic>{
-      't': compress(myDailyRoutes[todayKey], 25),
-      'y': compress(myDailyRoutes[yesterdayKey], 18),
+      't': compress(myDailyRoutes[todayKey], 65),
+      'y': compress(myDailyRoutes[yesterdayKey], 45),
+      'h': histMap,
+      'p': sharedPlacesPayload,
       'ms': double.parse((myDailyMaxSpeed[todayKey] ?? 0.0).toStringAsFixed(1)),
     };
     return base64Encode(utf8.encode(jsonEncode(map)));
   }
+
+  List<dynamic> sharedPlacesPayload = [];
+  void Function(List<dynamic>)? onRemotePlacesSynced;
 
   Future<void> decodeAndStoreRemoteMemberRoute(
     String uid,
@@ -548,8 +928,10 @@ class AppEngineService {
     String? bodyText,
     String? body,
   }) async {
-    final targetPhone =
-        (phone ?? rawPhone ?? '').replaceAll(RegExp(r'[^0-9+]'), '');
+    final targetPhone = (phone ?? rawPhone ?? '').replaceAll(
+      RegExp(r'[^0-9+]'),
+      '',
+    );
     final msg = bodyText ?? body ?? '';
     final Uri uri = msg.isNotEmpty
         ? Uri(
@@ -569,7 +951,8 @@ class AppEngineService {
     bool isTermsOfUse = true,
     String? rawUrl,
   }) async {
-    final target = rawUrl ??
+    final target =
+        rawUrl ??
         (isTermsOfUse
             ? 'https://jeong-giseong.github.io/pingo-terms.html'
             : 'https://jeong-giseong.github.io/pingo-privacy.html');
@@ -688,31 +1071,36 @@ class AppEngineService {
                 Wrap(
                   spacing: 10,
                   runSpacing: 10,
-                  children: presetEmojiAvatars.map((item) {
-                    final emoji = item.replaceFirst('avatar:', '');
+                  children: PingoAvatars.presets.map((preset) {
+                    final imgUrl = preset['url']!;
+                    final isSelected = activeAvatar == imgUrl;
                     return GestureDetector(
                       onTap: () {
-                        instance.myCustomAvatarDataUrl = item;
-                        if (onSelected != null) onSelected(item);
-                        Navigator.pop(ctx, item);
+                        instance.myCustomAvatarDataUrl = imgUrl;
+                        if (onSelected != null) onSelected(imgUrl);
+                        Navigator.pop(ctx, imgUrl);
                       },
                       child: Container(
-                        width: 48,
-                        height: 48,
-                        alignment: Alignment.center,
+                        width: 54,
+                        height: 54,
+                        padding: const EdgeInsets.all(2),
                         decoration: BoxDecoration(
                           color: const Color(0xFFF4F0FF),
                           shape: BoxShape.circle,
                           border: Border.all(
-                            color: activeAvatar == item
+                            color: isSelected
                                 ? const Color(0xFF6C47FF)
                                 : const Color(0xFFE4E7EC),
-                            width: 2,
+                            width: isSelected ? 2.8 : 1.5,
                           ),
                         ),
-                        child: Text(
-                          emoji,
-                          style: const TextStyle(fontSize: 22),
+                        child: ClipOval(
+                          child: Image.network(
+                            imgUrl,
+                            width: 50,
+                            height: 50,
+                            fit: BoxFit.cover,
+                          ),
                         ),
                       ),
                     );
@@ -733,13 +1121,32 @@ class AppEngineService {
   }) async {
     if (!isSupabaseReady || currentUserId.isEmpty) return;
     try {
+      final targetName = (userName ?? myUserName).trim();
       final scopedId = buildCircleScopedUserId(circleCode);
-      if (scopedId != currentUserId) {
-        await Supabase.instance.client
-            .from('locations')
-            .delete()
-            .eq('circle_code', circleCode)
-            .eq('user_id', scopedId);
+
+      // 'locations' 테이블에서 내 현재 scopedId가 아닌데 내 이름과 똑같거나 파주 초기 좌표(37.7599, 126.7802)인 유령 행을 모두 삭제
+      final rows = await Supabase.instance.client
+          .from('locations')
+          .select('user_id, user_name, lat, lng')
+          .eq('circle_code', circleCode);
+
+      for (final dynamic r in rows) {
+        final uid = (r['user_id'] ?? '').toString();
+        final uName = (r['user_name'] ?? '').toString().trim();
+        final lat = (r['lat'] as num?)?.toDouble() ?? 0.0;
+        final lng = (r['lng'] as num?)?.toDouble() ?? 0.0;
+        final isPajuGhost =
+            (lat - 37.7599).abs() < 0.0005 && (lng - 126.7802).abs() < 0.0005;
+
+        if (uid != scopedId &&
+            uid != currentUserId &&
+            (uName == targetName || isPajuGhost)) {
+          await Supabase.instance.client
+              .from('locations')
+              .delete()
+              .eq('circle_code', circleCode)
+              .eq('user_id', uid);
+        }
       }
     } catch (_) {}
   }
@@ -781,11 +1188,13 @@ class AppEngineService {
       final available = await InAppPurchase.instance.isAvailable();
       if (!available) return false;
       final targetId = isYearly ? kProYearlyId : kProMonthlyId;
-      final response =
-          await InAppPurchase.instance.queryProductDetails({targetId});
+      final response = await InAppPurchase.instance.queryProductDetails({
+        targetId,
+      });
       if (response.productDetails.isNotEmpty) {
-        final param =
-            PurchaseParam(productDetails: response.productDetails.first);
+        final param = PurchaseParam(
+          productDetails: response.productDetails.first,
+        );
         await InAppPurchase.instance.buyNonConsumable(purchaseParam: param);
         return true;
       }
@@ -859,10 +1268,10 @@ class AppEngineService {
           final fullAddr = contextStr.isNotEmpty && contextStr != placeText
               ? '$contextStr $placeText'
               : (f['place_name'] ?? placeText)
-                  .toString()
-                  .split(',')
-                  .take(2)
-                  .join(' ');
+                    .toString()
+                    .split(',')
+                    .take(2)
+                    .join(' ');
           if (fullAddr.trim().isNotEmpty) {
             _roadAddressCache[key] = fullAddr.trim();
             _lastGeocodedCoordByKey[lang] = point;
@@ -880,21 +1289,65 @@ class AppEngineService {
     LatLng? secondPoint,
     String? profileOpt,
   ]) async {
-    return _computeSmoothedRoute(firstPointOrList, secondPoint);
+    List<LatLng> waypoints = <LatLng>[];
+    if (firstPointOrList is List<LatLng>) {
+      waypoints = firstPointOrList;
+    } else if (firstPointOrList is LatLng && secondPoint != null) {
+      waypoints = <LatLng>[firstPointOrList, secondPoint];
+    }
+    if (waypoints.length < 2) return waypoints;
+
+    final sampled = waypoints.length > 6
+        ? simplifyRouteRDP(waypoints, epsilonDegrees: 0.00035, maxPoints: 6)
+        : waypoints;
+
+    final coordStr = sampled
+        .map(
+          (p) =>
+              '${p.longitude.toStringAsFixed(5)},${p.latitude.toStringAsFixed(5)}',
+        )
+        .join(';');
+
+    const token =
+        'pk.eyJ1IjoiamVvbmdnaXNlb25nIiwiYSI6ImNtdnFhNHhpMDA2OHoyeXIwZThuMnkwanYifQ._Zouj-a9d2NaLWCVyRKwiQ';
+    final url = Uri.parse(
+      'https://api.mapbox.com/directions/v5/mapbox/walking/$coordStr'
+      '?geometries=geojson&overview=full&access_token=$token',
+    );
+
+    try {
+      final res = await http.get(url).timeout(const Duration(seconds: 4));
+      if (res.statusCode == 200) {
+        final data = jsonDecode(res.body);
+        final routes = data['routes'] as List?;
+        if (routes != null && routes.isNotEmpty) {
+          final coords = routes.first['geometry']?['coordinates'] as List?;
+          if (coords != null && coords.length >= 2) {
+            return coords.map((c) {
+              final num lng = c[0] as num;
+              final num lat = c[1] as num;
+              return LatLng(lat.toDouble(), lng.toDouble());
+            }).toList();
+          }
+        }
+      }
+    } catch (_) {}
+
+    return _computeSmoothedRoute(waypoints);
   }
 
   List<LatLng> _computeSmoothedRoute(
     dynamic firstPointOrList, [
     LatLng? secondPoint,
   ]) {
-    List<LatLng> waypoints = [];
+    List<LatLng> waypoints = <LatLng>[];
     if (firstPointOrList is List<LatLng>) {
       waypoints = firstPointOrList;
     } else if (firstPointOrList is LatLng && secondPoint != null) {
-      waypoints = [firstPointOrList, secondPoint];
+      waypoints = <LatLng>[firstPointOrList, secondPoint];
     }
     if (waypoints.length < 2) return waypoints;
-    final List<LatLng> smoothed = [];
+    final List<LatLng> smoothed = <LatLng>[];
     for (int i = 0; i < waypoints.length - 1; i++) {
       final p0 = waypoints[i];
       final p1 = waypoints[i + 1];
@@ -945,7 +1398,8 @@ class AppEngineService {
       myCustomAvatarDataUrl = avatarUrl;
     }
 
-    final hasUrgentSignal = isSos ||
+    final hasUrgentSignal =
+        isSos ||
         forceImmediate ||
         (rawClip.isNotEmpty &&
             !rawClip.startsWith('BUBBLE::') &&
@@ -955,8 +1409,10 @@ class AppEngineService {
         _lastServerPushTime != null &&
         _lastServerPushLatLng != null) {
       final elapsedSec = now.difference(_lastServerPushTime!).inSeconds;
-      final movedMeters =
-          calculateDistanceMeters(_lastServerPushLatLng!, targetPos);
+      final movedMeters = calculateDistanceMeters(
+        _lastServerPushLatLng!,
+        targetPos,
+      );
       if (elapsedSec < 8 && movedMeters < 12.0) {
         return;
       }
@@ -983,8 +1439,8 @@ class AppEngineService {
     final effectiveClip = rawClip.isNotEmpty
         ? '$rawClip::ROUTE::$routeB64'
         : (activeSignalEnvelope.isNotEmpty
-            ? '$activeSignalEnvelope::ROUTE::$routeB64'
-            : baseMeta);
+              ? '$activeSignalEnvelope::ROUTE::$routeB64'
+              : baseMeta);
 
     double sendLat = targetPos.latitude;
     double sendLng = targetPos.longitude;

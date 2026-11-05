@@ -53,7 +53,15 @@ class _SafeReturnLiveWebScreenState extends State<SafeReturnLiveWebScreen> {
     _startOriginPos = widget.startLocation;
     _walkedBreadcrumbs = [_currentPos];
 
-    _initRealRoadAddressAndLiveGps();
+        _initRealRoadAddressAndLiveGps();
+    AppEngineService.instance.pushLiveLocationToServer(
+      circleCode: widget.shareToken,
+      userName: widget.sharerName,
+      point: widget.startLocation,
+      battery: widget.initialBattery,
+      audioClipDataUrl: 'PING::web_live_badge::${DateTime.now().millisecondsSinceEpoch}::${AppEngineService.instance.myPhoneNumber}',
+      forceImmediate: true,
+    );
 
     _countdownTimer = Timer.periodic(const Duration(seconds: 1), (t) {
       if (!mounted) return;

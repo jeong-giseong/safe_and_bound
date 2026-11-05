@@ -48,7 +48,7 @@ class _CircleInviteScreenState extends State<CircleInviteScreen> {
         final data = jsonDecode(raw) as Map<String, dynamic>;
         final savedUserName = (data['userName'] as String?)?.trim() ?? '';
         final savedAvatarUrl =
-            (data['avatarUrl'] as String?)?.trim() ??
+            ((data['avatarUrl'] as String?)?.trim().startsWith('http') == true || (data['avatarUrl'] as String?)?.trim().startsWith('data:image') == true ? (data['avatarUrl'] as String?)!.trim() : null) ??
             PingoAvatars.presets[0]['url']!;
         final savedCircleName =
             (data['circleName'] as String?)?.trim() ??
