@@ -40,8 +40,6 @@ class AppEngineService {
   static const String kProYearlyId = 'pingo_pro_yearly';
 
   final Map<String, String> _roadAddressCache = {};
-  final Map<String, LatLng> _lastGeocodedCoordByKey = {};
-  final Map<String, DateTime> _lastGeocodedTimeByKey = {};
   final Map<String, String> memberPhones = {};
   final Map<String, bool> circleHiddenMap = {};
   final Set<String> blockedUserIds = {};
@@ -214,7 +212,7 @@ class AppEngineService {
   Future<void> _loadPersistentTimelineHistory() async {
     try {
       final rawJson = await _readPersistentText(
-        'pingo_timeline_history_v3.json',
+        'pingo_timeline_history_v4.json',
       );
       if (rawJson.isNotEmpty) {
         final decoded = jsonDecode(rawJson) as Map<String, dynamic>;
@@ -349,6 +347,8 @@ class AppEngineService {
     return math.sqrt(distX * distX + distY * distY);
   }
 
+  DateTime? _lastBreadcrumbRecordedAt;
+
   Future<List<LatLng>> recordMyLocationBreadcrumb(
     LatLng point, {
     double speedKmh = 0.0,
@@ -362,36 +362,33 @@ class AppEngineService {
       return List<LatLng>.from(myDailyRoutes[tKey] ?? <LatLng>[]);
     }
 
-    final list = myDailyRoutes.putIfAbsent(tKey, () {
-      final yList = myDailyRoutes[yesterdayKey];
-      if (yList != null &&
-          yList.isNotEmpty &&
-          !isDummyOrInvalidPoint(yList.last)) {
-        return <LatLng>[yList.last];
-      }
-      return <LatLng>[];
-    });
+    final list = myDailyRoutes.putIfAbsent(tKey, () => <LatLng>[]);
+    final now = DateTime.now();
 
     if (list.isEmpty) {
       list.add(point);
+      _lastBreadcrumbRecordedAt = now;
     } else {
       final dist = calculateDistanceMeters(list.last, point);
-      if (dist >= 10.0 && dist <= 15000.0) {
+      final elapsedMins = _lastBreadcrumbRecordedAt == null
+          ? 999
+          : now.difference(_lastBreadcrumbRecordedAt!).inMinutes;
+
+      if (dist >= 25.0 && dist <= 5000.0) {
+        // 1) 정상 이동 (25m 이상 이동 시 궤적 추가)
         list.add(point);
-      } else if (dist > 15000.0 && list.length <= 2) {
+        _lastBreadcrumbRecordedAt = now;
+      } else if (dist < 25.0 && speedKmh < 2.5 && elapsedMins >= 5) {
+        // 2) 커피숍·술집·식당 등 실내 장기 체류 감지:
+        // 움직이지 않고 한자리에 가만히 앉아 있어도 5분마다 체류 샘플을 누적하여
+        // 길거리 잠깐 대기(5분 미만)와 확실하게 체류 점수 차이를 벌림!
+        list.add(list.last);
+        _lastBreadcrumbRecordedAt = now;
+      } else if (dist > 5000.0 && list.length <= 2) {
         list
           ..clear()
           ..add(point);
-      }
-      if (list.length > 1500) {
-        final compacted = simplifyRouteRDP(
-          list,
-          epsilonDegrees: 0.00008,
-          maxPoints: 1200,
-        );
-        list
-          ..clear()
-          ..addAll(compacted);
+        _lastBreadcrumbRecordedAt = now;
       }
     }
 
@@ -416,19 +413,17 @@ class AppEngineService {
         }
       });
       await _writePersistentText(
-        'pingo_timeline_history_v3.json',
+        'pingo_timeline_history_v4.json',
         jsonEncode(serialized),
       );
       await _writePersistentText(
-        'pingo_timeline_maxspeed_v3.json',
+        'pingo_timeline_maxspeed_v4.json',
         jsonEncode(myDailyMaxSpeed),
       );
     } catch (_) {}
     return List<LatLng>.from(list);
   }
 
-  final Map<String, List<LatLng>> _snappedRoadCache = {};
-  final Set<String> _pendingRoadSnapKeys = {};
   final Set<String> _pendingGeocodeKeys = {};
   void Function()? onTimelineMetaUpdated;
 
@@ -443,25 +438,55 @@ class AppEngineService {
 
     List<LatLng> rawWaypoints = <LatLng>[];
 
-    if ((memberId == 'm2' || memberId == 'm3') &&
+    // 나(m1)는 절대 데모 경로를 타지 않고 실제 GPS 기록만 사용! 데모는 m2, m3 전용
+    if (!isMe &&
+        (memberId == 'm2' || memberId == 'm3') &&
         (sourceMap == null || sourceMap.isEmpty)) {
       final base = isDummyOrInvalidPoint(fallbackLoc)
           ? const LatLng(37.2636, 127.0286)
           : fallbackLoc;
-      if (tabIndex == 0) {
-        rawWaypoints = <LatLng>[
-          LatLng(base.latitude - 0.0048, base.longitude - 0.0036),
-          LatLng(base.latitude - 0.0022, base.longitude - 0.0029),
-          LatLng(base.latitude - 0.0009, base.longitude - 0.0011),
-          base,
-        ];
+      if (memberId == 'm2') {
+        if (tabIndex == 0) {
+          // 출발 ➔ 카페(장기 체류) ➔ 마트/식당(장기 체류) ➔ 현재 위치 시뮬레이션
+          rawWaypoints = <LatLng>[
+            LatLng(base.latitude - 0.0045, base.longitude - 0.0032),
+            LatLng(base.latitude - 0.0045, base.longitude - 0.0032),
+            LatLng(base.latitude - 0.0045, base.longitude - 0.0032),
+            LatLng(base.latitude - 0.0018, base.longitude - 0.0015),
+            LatLng(base.latitude - 0.0018, base.longitude - 0.0015),
+            LatLng(base.latitude - 0.0018, base.longitude - 0.0015),
+            LatLng(base.latitude - 0.0018, base.longitude - 0.0015),
+            base,
+          ];
+        } else {
+          rawWaypoints = <LatLng>[
+            LatLng(base.latitude + 0.0048, base.longitude - 0.0035),
+            LatLng(base.latitude + 0.0048, base.longitude - 0.0035),
+            LatLng(base.latitude + 0.0021, base.longitude + 0.0014),
+            LatLng(base.latitude + 0.0021, base.longitude + 0.0014),
+            LatLng(base.latitude + 0.0021, base.longitude + 0.0014),
+            base,
+          ];
+        }
       } else {
-        rawWaypoints = <LatLng>[
-          LatLng(base.latitude + 0.0052, base.longitude - 0.0038),
-          LatLng(base.latitude + 0.0028, base.longitude - 0.0014),
-          LatLng(base.latitude + 0.0012, base.longitude + 0.0019),
-          base,
-        ];
+        // m3 데모 친구도 오늘/어제 뚜렷한 거점 핀과 상호명이 나오도록 구성
+        if (tabIndex == 0) {
+          rawWaypoints = <LatLng>[
+            LatLng(base.latitude + 0.0032, base.longitude + 0.0028),
+            LatLng(base.latitude + 0.0032, base.longitude + 0.0028),
+            LatLng(base.latitude + 0.0032, base.longitude + 0.0028),
+            base,
+          ];
+        } else {
+          rawWaypoints = <LatLng>[
+            LatLng(base.latitude - 0.0038, base.longitude + 0.0022),
+            LatLng(base.latitude - 0.0038, base.longitude + 0.0022),
+            LatLng(base.latitude - 0.0015, base.longitude - 0.0012),
+            LatLng(base.latitude - 0.0015, base.longitude - 0.0012),
+            LatLng(base.latitude - 0.0015, base.longitude - 0.0012),
+            base,
+          ];
+        }
       }
     } else if (sourceMap == null) {
       rawWaypoints = isDummyOrInvalidPoint(fallbackLoc)
@@ -503,26 +528,18 @@ class AppEngineService {
       }
     }
 
-    if (rawWaypoints.length < 2) return rawWaypoints;
-
-    final String cacheKey =
-        '${memberId}_${tabIndex}_${customDateKey ?? ""}_${rawWaypoints.length}_${rawWaypoints.first.latitude.toStringAsFixed(4)}_${rawWaypoints.last.latitude.toStringAsFixed(4)}';
-
-    if (_snappedRoadCache.containsKey(cacheKey)) {
-      return _snappedRoadCache[cacheKey]!;
-    }
-
-    if (!_pendingRoadSnapKeys.contains(cacheKey)) {
-      _pendingRoadSnapKeys.add(cacheKey);
-      fetchRoadSnappedRoute(rawWaypoints).then((snapped) {
-        if (snapped.length >= 2) {
-          _snappedRoadCache[cacheKey] = snapped;
-          onTimelineMetaUpdated?.call();
-        }
-      });
-    }
-
     return rawWaypoints;
+  }
+
+  // 주소 문자열이 단순 도로명/행정동인지, 아니면 실제 상호명(POI: 카페/술집/매장)인지 판별
+  bool _isLikelyPoiName(String name) {
+    final t = name.trim();
+    if (t.isEmpty || t == AppStrings.t('loading_address')) return false;
+    if (RegExp(r'^\d+\.\d+').hasMatch(t)) return false;
+    // 도로명 주소 패턴 (~로 123, ~길 45, ~대로) 또는 단순 동/구/시 패턴이면 일반 주소로 판정
+    final isRoadPattern = RegExp(r'(대로|번길|로|길)\s*\d*|([가-힣]+(동|구|읍|면|리))$')
+        .hasMatch(t);
+    return !isRoadPattern;
   }
 
   String resolvePlaceOrPoiName(
@@ -532,13 +549,13 @@ class AppEngineService {
     if (safePlaces != null) {
       for (final sp in safePlaces) {
         final d = calculateDistanceMeters(point, sp.point);
-        if (d <= math.max(sp.radiusMeters, 120.0)) {
+        if (d <= math.max(sp.radiusMeters, 90.0)) {
           return sp.name;
         }
       }
     }
     final key =
-        '${point.latitude.toStringAsFixed(3)}_${point.longitude.toStringAsFixed(3)}';
+        '${point.latitude.toStringAsFixed(4)}_${point.longitude.toStringAsFixed(4)}';
     final cached = _roadAddressCache[key];
     if (cached != null && cached.isNotEmpty) {
       return cached;
@@ -547,44 +564,117 @@ class AppEngineService {
       _pendingGeocodeKeys.add(key);
       _fetchPoiOrRoadNameInBackground(point, key);
     }
-    return '${point.latitude.toStringAsFixed(4)}, ${point.longitude.toStringAsFixed(4)}';
+    return AppStrings.t('loading_address');
   }
 
   Future<void> _fetchPoiOrRoadNameInBackground(
     LatLng point,
     String cacheKey,
   ) async {
+    final label = await _lookupHybridPoiAndRoad(point);
+    if (label.isNotEmpty) {
+      _roadAddressCache[cacheKey] = label;
+      onTimelineMetaUpdated?.call();
+    } else {
+      _pendingGeocodeKeys.remove(cacheKey);
+    }
+  }
+
+  Future<String> _lookupHybridPoiAndRoad(LatLng point) async {
+    final langCode = AppStrings.lang;
     const token =
         'pk.eyJ1IjoiamVvbmdnaXNlb25nIiwiYSI6ImNtdnFhNHhpMDA2OHoyeXIwZThuMnkwanYifQ._Zouj-a9d2NaLWCVyRKwiQ';
-    final langCode = AppStrings.lang;
-    final url = Uri.parse(
-      'https://api.mapbox.com/geocoding/v5/mapbox.places/${point.longitude},${point.latitude}.json'
-      '?types=poi,address,neighborhood,locality&language=$langCode&limit=1&access_token=$token',
-    );
+
+    String mbPoi = '';
+    String mbAddr = '';
+    String mbDong = '';
+
+    // 1차(초고속·무차단): Mapbox 역지오코딩 (limit 파라미터 제거로 422 에러 원천 차단!)
     try {
-      final res = await http.get(url).timeout(const Duration(seconds: 4));
+      final mbUrl = Uri.parse(
+        'https://api.mapbox.com/geocoding/v5/mapbox.places/${point.longitude},${point.latitude}.json'
+        '?types=poi,address,neighborhood,locality&language=$langCode&access_token=$token',
+      );
+      final res = await http.get(mbUrl).timeout(const Duration(seconds: 3));
       if (res.statusCode == 200) {
         final data = jsonDecode(res.body);
         final features = data['features'] as List?;
         if (features != null && features.isNotEmpty) {
-          final f = features.first;
-          final placeText = (f['text'] ?? '').toString().trim();
-          String contextStr = '';
-          final ctxList = f['context'] as List?;
-          if (ctxList != null && ctxList.isNotEmpty) {
-            contextStr = (ctxList.first['text'] ?? '').toString().trim();
+          for (final dynamic item in features) {
+            final types = (item['place_type'] as List?)?.cast<String>() ?? [];
+            final txt = (item['text'] ?? '').toString().trim();
+            final addrNum = (item['address'] ?? '').toString().trim();
+            if (types.contains('poi') && mbPoi.isEmpty && txt.isNotEmpty) {
+              mbPoi = txt;
+            } else if (types.contains('address') &&
+                mbAddr.isEmpty &&
+                txt.isNotEmpty) {
+              mbAddr = addrNum.isNotEmpty ? '$txt $addrNum' : txt;
+            } else if ((types.contains('neighborhood') ||
+                    types.contains('locality')) &&
+                mbDong.isEmpty &&
+                txt.isNotEmpty) {
+              mbDong = txt;
+            }
           }
-          final label = (contextStr.isNotEmpty && contextStr != placeText)
-              ? '$contextStr $placeText'
-              : placeText;
-          if (label.isNotEmpty) {
-            _roadAddressCache[cacheKey] = label;
-            onTimelineMetaUpdated?.call();
-            return;
-          }
+          // 등록된 상호(POI)가 있으면 군더더기 주소 없이 깔끔하게 상호명만 즉시 반환!
+          if (mbPoi.isNotEmpty) return mbPoi;
         }
       }
     } catch (_) {}
+
+    // 2차(상세 한국 상가/건물명 보강): OpenStreetMap Nominatim (zoom=18)
+    try {
+      final osmUrl = Uri.parse(
+        'https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=${point.latitude}&lon=${point.longitude}&zoom=18&addressdetails=1&accept-language=$langCode',
+      );
+      final osmRes = await http
+          .get(osmUrl, headers: {'User-Agent': 'PingoSafetyApp/1.0'})
+          .timeout(const Duration(seconds: 3));
+      if (osmRes.statusCode == 200) {
+        final data = jsonDecode(osmRes.body);
+        final String poiName = (data['name'] ?? '').toString().trim();
+        final addr = data['address'] as Map<String, dynamic>?;
+        String dong = '';
+        String road = '';
+        String houseNum = '';
+        String building = '';
+        if (addr != null) {
+          dong =
+              (addr['quarter'] ??
+                      addr['neighbourhood'] ??
+                      addr['suburb'] ??
+                      addr['village'] ??
+                      addr['town'] ??
+                      '')
+                  .toString()
+                  .trim();
+          road = (addr['road'] ?? addr['pedestrian'] ?? '').toString().trim();
+          houseNum = (addr['house_number'] ?? '').toString().trim();
+          building =
+              (addr['amenity'] ??
+                      addr['shop'] ??
+                      addr['building'] ??
+                      addr['tourism'] ??
+                      addr['office'] ??
+                      '')
+                  .toString()
+                  .trim();
+        }
+        final String bestPoi = poiName.isNotEmpty ? poiName : building;
+        if (bestPoi.isNotEmpty && bestPoi != road && bestPoi != dong) {
+          return bestPoi;
+        }
+        if (road.isNotEmpty) {
+          return houseNum.isNotEmpty ? '$road $houseNum' : road;
+        }
+        if (dong.isNotEmpty) return dong;
+      }
+    } catch (_) {}
+
+    if (mbAddr.isNotEmpty) return mbAddr;
+    if (mbDong.isNotEmpty) return mbDong;
+    return '';
   }
 
   List getThirtyDaysDailyBreakdown(
@@ -608,7 +698,7 @@ class AppEngineService {
         final placesCnt = steps.length;
         final mins = pts.length < 2
             ? 0
-            : (distKm * 6.5 + placesCnt * 4).round();
+            : (distKm * 6.5 + placesCnt * 12).round();
         result.add({
           'dateKey': k,
           'points': pts,
@@ -619,7 +709,7 @@ class AppEngineService {
       }
     }
 
-    if (result.isEmpty && (memberId == 'm2' || memberId == 'm3')) {
+    if (result.isEmpty && !isMe && (memberId == 'm2' || memberId == 'm3')) {
       final now = DateTime.now();
       for (int d = 0; d < 5; d++) {
         final dt = now.subtract(Duration(days: d));
@@ -640,7 +730,7 @@ class AppEngineService {
           'points': demoPts,
           'distanceKm': distKm,
           'placesCount': steps.length,
-          'minutes': (distKm * 8).round().clamp(15, 240),
+          'minutes': (distKm * 8 + steps.length * 15).round().clamp(15, 240),
         });
       }
     }
@@ -651,84 +741,178 @@ class AppEngineService {
     List<LatLng> validRoute, {
     List<SafePlaceData>? safePlaces,
   }) {
-    if (validRoute.isEmpty) return [];
-    if (validRoute.length == 1) {
+    final cleanPts = validRoute
+        .where((p) => !isDummyOrInvalidPoint(p))
+        .toList();
+    if (cleanPts.isEmpty) return [];
+    if (cleanPts.length == 1) {
       final placeName = resolvePlaceOrPoiName(
-        validRoute.first,
+        cleanPts.first,
         safePlaces: safePlaces,
       );
       return [
         {
           'type': 'end',
-          'point': validRoute.first,
+          'stopNumber': 1,
+          'point': cleanPts.first,
           'placeName': placeName,
+          'stayMinutes': 15,
+          'stayLabel': AppStrings.t('status_staying'),
+          'tripMode': 'stay',
+          'tripLabel': '',
           'segmentKm': 0.0,
+          'tripMinutes': 0,
           'progressRatio': 1.0,
         },
       ];
     }
 
-    // 1단계: 하루 외근/장거리 이동 시에도 실제 방문 거점이 누락되지 않도록 상한을 40곳으로 확장
-    final rdpCandidates = simplifyRouteRDP(
-      validRoute,
-      epsilonDegrees: 0.00042,
-      maxPoints: 40,
-    );
+    // 1단계: 근접 정차 병합 (반경 75m 이내 점들을 하나의 클러스터로 묶어 술집 앞 대리/택시 대기 등을 하나로 흡수)
+    final List<LatLng> clusterCenters = [cleanPts.first];
+    final List<int> clusterCounts = [1];
 
-    // 2단계: 단순 신호대기/골목 코너 중복을 걸러내는 160m 공간 클러스터링
-    final keyNodes = [rdpCandidates.first];
-    for (int i = 1; i < rdpCandidates.length - 1; i++) {
-      final distFromPrev = calculateDistanceMeters(
-        keyNodes.last,
-        rdpCandidates[i],
-      );
-      final distToEnd = calculateDistanceMeters(
-        rdpCandidates[i],
-        rdpCandidates.last,
-      );
-      if (distFromPrev >= 160.0 && distToEnd >= 160.0) {
-        keyNodes.add(rdpCandidates[i]);
+    for (int i = 1; i < cleanPts.length; i++) {
+      final dist = calculateDistanceMeters(clusterCenters.last, cleanPts[i]);
+      if (dist <= 75.0) {
+        clusterCounts[clusterCounts.length - 1]++;
+      } else {
+        clusterCenters.add(cleanPts[i]);
+        clusterCounts.add(1);
       }
     }
-    if (calculateDistanceMeters(keyNodes.last, rdpCandidates.last) >= 60.0 ||
-        keyNodes.length == 1) {
-      keyNodes.add(rdpCandidates.last);
+
+    // 2단계: 길거리 대기(10번) vs 실제 방문지(카페/술집 2~3번) 가중치 평가 (Significance Scoring)
+    // 출발지(index 0)와 최종 도착지(last index)는 무조건 유지하고, 중간 후보지들만 점수를 매겨 상위 거점(최대 5곳) 선발
+    final List<int> selectedIndices = [0];
+    if (clusterCenters.length > 2) {
+      final List midCandidates = [];
+      for (int i = 1; i < clusterCenters.length - 1; i++) {
+        final pt = clusterCenters[i];
+        final cnt = clusterCounts[i];
+        final distFromStart = calculateDistanceMeters(clusterCenters.first, pt);
+        final distToEnd = calculateDistanceMeters(pt, clusterCenters.last);
+        if (distFromStart < 85.0 || distToEnd < 85.0) continue;
+
+        final resolvedName = resolvePlaceOrPoiName(pt, safePlaces: safePlaces);
+        final bool isPoi = _isLikelyPoiName(resolvedName);
+        final int estStayMins = cnt * 7;
+
+        // 중요도 점수 계산: 상호명(POI)이 있으면 2.5배 가중치, 단순 도로명이면 0.4배 페널티
+        final double score = estStayMins * (isPoi ? 2.5 : 0.4);
+
+        // 길거리 단순 정차 탈락 기준:
+        // - 상호(POI)가 있는 카페/술집은 10분 이상(cnt >= 2) 머물면 통과
+        // - 상호가 없는 단순 도로/길가는 최소 28분 이상(cnt >= 4) 머물러야만 통과 (잠깐 차/친구 기다린 곳 100% 탈락!)
+        final bool passesCutoff = isPoi ? (cnt >= 2) : (cnt >= 4);
+        if (passesCutoff || clusterCenters.length <= 4) {
+          midCandidates.add({'index': i, 'score': score});
+        }
+      }
+
+      // 점수가 가장 높은 상위 5개 핵심 방문지(카페·술집 등)만 추린 뒤, 다시 시간순(index 오름차순) 정렬
+      midCandidates.sort(
+        (a, b) => (b['score'] as double).compareTo(a['score'] as double),
+      );
+      final topMids = midCandidates.take(5).toList()
+        ..sort((a, b) => (a['index'] as int).compareTo(b['index'] as int));
+
+      for (final item in topMids) {
+        selectedIndices.add(item['index'] as int);
+      }
+    }
+    if (clusterCenters.length > 1) {
+      final lastIdx = clusterCenters.length - 1;
+      if (calculateDistanceMeters(
+                clusterCenters[selectedIndices.last],
+                clusterCenters[lastIdx],
+              ) >=
+              50.0 ||
+          selectedIndices.length == 1) {
+        selectedIndices.add(lastIdx);
+      }
     }
 
-    // 3단계: 역지오코딩 주소 변환 + 직전 방문지와 주소/건물명이 동일하면 1곳으로 자동 병합(Merge)
-    final mergedSteps = [];
-    for (int i = 0; i < keyNodes.length; i++) {
-      final pt = keyNodes[i];
-      final placeName = resolvePlaceOrPoiName(pt, safePlaces: safePlaces);
+    // 3단계: 선발된 핵심 거점들의 상호명 매핑 & 연속 동일 상호 병합 + 탈락한 길거리 대기 구간은 이동(Trip) 거리·시간에 합산
+    final List mergedSteps = [];
+    for (int k = 0; k < selectedIndices.length; k++) {
+      final int currClusterIdx = selectedIndices[k];
+      final LatLng pt = clusterCenters[currClusterIdx];
+      final String placeName = resolvePlaceOrPoiName(
+        pt,
+        safePlaces: safePlaces,
+      );
+
+      // 이전 선발 거점부터 현재 선발 거점 사이의 실제 누적 이동 거리 계산 (중간에 탈락한 길거리 대기 구간 거리 포함)
       double segKm = 0.0;
-      if (i > 0) {
-        segKm = calculateDistanceMeters(keyNodes[i - 1], pt) / 1000.0;
+      int transitWaitMins = 0;
+      if (k > 0) {
+        final int prevClusterIdx = selectedIndices[k - 1];
+        for (int m = prevClusterIdx + 1; m <= currClusterIdx; m++) {
+          segKm +=
+              calculateDistanceMeters(
+                clusterCenters[m - 1],
+                clusterCenters[m],
+              ) /
+              1000.0;
+          if (m < currClusterIdx) {
+            transitWaitMins += clusterCounts[m] * 3;
+          }
+        }
       }
 
-      final bool isCoordinateFallback =
-          placeName.contains(',') &&
-          RegExp(r'^\d+\.\d+').hasMatch(placeName.trim());
+      final int stayMins = (clusterCounts[currClusterIdx] * 12).clamp(10, 240);
 
       if (mergedSteps.isNotEmpty &&
-          !isCoordinateFallback &&
+          placeName != AppStrings.t('loading_address') &&
           mergedSteps.last['placeName'] == placeName) {
         mergedSteps.last['segmentKm'] =
             (mergedSteps.last['segmentKm'] as double) + segKm;
         mergedSteps.last['point'] = pt;
+        mergedSteps.last['stayMinutes'] =
+            (mergedSteps.last['stayMinutes'] as int) + stayMins;
+        final int updatedStay = mergedSteps.last['stayMinutes'] as int;
+        mergedSteps.last['stayLabel'] =
+            '$updatedStay${AppStrings.t('stat_mins_unit')} ${AppStrings.t('status_staying')}';
       } else {
+        final bool isDriving = segKm >= 0.85;
+        final int baseMoveMins = segKm <= 0.01
+            ? 0
+            : (isDriving
+                  ? (segKm * 2.4).round().clamp(2, 180)
+                  : (segKm * 12.0).round().clamp(2, 120));
+        final int tripMins = baseMoveMins + transitWaitMins;
+        final String distStr = segKm >= 1.0
+            ? '${segKm.toStringAsFixed(1)}km'
+            : '${(segKm * 1000).round()}m';
+        final String tripMode = segKm <= 0.01
+            ? 'stay'
+            : (isDriving ? 'drive' : 'walk');
+        final String tripLabel = segKm <= 0.01
+            ? ''
+            : (isDriving
+                  ? '🚗 ${AppStrings.t('status_driving')} $distStr · $tripMins${AppStrings.t('stat_mins_unit')}'
+                  : '🚶 ${AppStrings.t('status_walking')} $distStr · $tripMins${AppStrings.t('stat_mins_unit')}');
+
         mergedSteps.add({
           'type': 'waypoint',
+          'stopNumber': mergedSteps.length + 1,
           'point': pt,
           'placeName': placeName,
+          'stayMinutes': stayMins,
+          'stayLabel':
+              '$stayMins${AppStrings.t('stat_mins_unit')} ${AppStrings.t('status_staying')}',
+          'tripMode': tripMode,
+          'tripLabel': tripLabel,
           'segmentKm': segKm,
+          'tripMinutes': tripMins,
           'progressRatio': 0.0,
         });
       }
     }
 
-    // 4단계: 시작점(start) / 경유점(waypoint) / 도착점(end) 타입 및 진행률 확정
     final int total = mergedSteps.length;
     for (int i = 0; i < total; i++) {
+      mergedSteps[i]['stopNumber'] = i + 1;
       mergedSteps[i]['type'] = i == 0
           ? 'start'
           : (i == total - 1 ? 'end' : 'waypoint');
@@ -1226,61 +1410,27 @@ class AppEngineService {
     List<SafePlaceData>? safePlaces,
     bool forceLookup = false,
   }) async {
-    if (!forceLookup && speedKmh >= 15.0) {
-      return '🚗 ${AppStrings.t('filter_moving')} (${speedKmh.toStringAsFixed(0)} km/h)';
+    if (safePlaces != null) {
+      for (final sp in safePlaces) {
+        if (calculateDistanceMeters(point, sp.point) <=
+            math.max(sp.radiusMeters, 90.0)) {
+          return sp.name;
+        }
+      }
     }
-    const lang = 'ko';
+    if (!forceLookup && speedKmh >= 15.0) {
+      return '🚗 ${AppStrings.t('status_driving')} (${speedKmh.toStringAsFixed(0)} km/h)';
+    }
     final key =
-        '${point.latitude.toStringAsFixed(3)}_${point.longitude.toStringAsFixed(3)}';
+        '${point.latitude.toStringAsFixed(4)}_${point.longitude.toStringAsFixed(4)}';
     if (_roadAddressCache.containsKey(key)) {
       return _roadAddressCache[key]!;
     }
-    final lastCoord = _lastGeocodedCoordByKey[lang];
-    final lastTime = _lastGeocodedTimeByKey[lang];
-    if (!forceLookup && lastCoord != null && lastTime != null) {
-      final movedMeters = calculateDistanceMeters(lastCoord, point);
-      final elapsedSec = DateTime.now().difference(lastTime).inSeconds;
-      if (movedMeters < 65.0 &&
-          elapsedSec < 180 &&
-          _roadAddressCache.isNotEmpty) {
-        return _roadAddressCache.values.last;
-      }
+    final label = await _lookupHybridPoiAndRoad(point);
+    if (label.isNotEmpty) {
+      _roadAddressCache[key] = label;
+      return label;
     }
-    const token =
-        'pk.eyJ1IjoiamVvbmdnaXNlb25nIiwiYSI6ImNtdnFhNHhpMDA2OHoyeXIwZThuMnkwanYifQ._Zouj-a9d2NaLWCVyRKwiQ';
-    final url = Uri.parse(
-      'https://api.mapbox.com/geocoding/v5/mapbox.places/${point.longitude},${point.latitude}.json'
-      '?types=address,poi,neighborhood,locality,place&language=ko&limit=1&access_token=$token',
-    );
-    try {
-      final res = await http.get(url).timeout(const Duration(seconds: 4));
-      if (res.statusCode == 200) {
-        final data = jsonDecode(res.body);
-        final features = data['features'] as List?;
-        if (features != null && features.isNotEmpty) {
-          final f = features.first;
-          final placeText = (f['text'] ?? '').toString();
-          String contextStr = '';
-          final ctxList = f['context'] as List?;
-          if (ctxList != null && ctxList.isNotEmpty) {
-            contextStr = (ctxList.first['text'] ?? '').toString();
-          }
-          final fullAddr = contextStr.isNotEmpty && contextStr != placeText
-              ? '$contextStr $placeText'
-              : (f['place_name'] ?? placeText)
-                    .toString()
-                    .split(',')
-                    .take(2)
-                    .join(' ');
-          if (fullAddr.trim().isNotEmpty) {
-            _roadAddressCache[key] = fullAddr.trim();
-            _lastGeocodedCoordByKey[lang] = point;
-            _lastGeocodedTimeByKey[lang] = DateTime.now();
-            return fullAddr.trim();
-          }
-        }
-      }
-    } catch (_) {}
     return '${point.latitude.toStringAsFixed(4)}, ${point.longitude.toStringAsFixed(4)}';
   }
 
@@ -1527,9 +1677,6 @@ class AppEngineService {
     List<LatLng>? myRecentRoute,
   }) async {
     try {
-      if (myRecentRoute != null && myRecentRoute.isNotEmpty) {
-        myDailyRoutes[todayKey] = List<LatLng>.from(myRecentRoute);
-      }
       final data = {
         'userName': userName,
         'myPhoneNumber': myPhoneNumber,

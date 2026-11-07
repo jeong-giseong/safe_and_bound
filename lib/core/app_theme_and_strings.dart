@@ -929,7 +929,24 @@ class AppStrings {
     },
   };
 
+  static const Map<String, Map<String, String>> _timelinePatchStrings = {
+    'ko': {'status_driving': '차량 이동', 'loading_address': '위치 확인 중...'},
+    'en': {'status_driving': 'Driving', 'loading_address': 'Locating...'},
+    'ja': {'status_driving': '車移動', 'loading_address': '位置確認中...'},
+    'zh': {'status_driving': '驾车移动', 'loading_address': '正在定位...'},
+    'vi': {
+      'status_driving': 'Di chuyển xe',
+      'loading_address': 'Đang định vị...',
+    },
+    'th': {
+      'status_driving': 'เดินทางด้วยรถ',
+      'loading_address': 'กำลังระบุตำแหน่ง...',
+    },
+  };
+
   static String t(String key) {
+    final patch = _timelinePatchStrings[lang]?[key];
+    if (patch != null) return patch;
     final extra = _extraTranslations[lang]?[key];
     if (extra != null) return extra;
     switch (lang) {

@@ -44,25 +44,22 @@
 	<key>UIApplicationSupportsIndirectInputEvents</key>
 	<true/>
 
-	<!-- 🛡️ Apple App Store 심사 필수 권한 설명 (Location / Mic / Photo) -->
+	<!-- ?썳截?Apple App Store ?ъ궗 ?꾩닔 沅뚰븳 ?ㅻ챸 (Location / Mic / Photo) -->
 	<key>NSLocationWhenInUseUsageDescription</key>
-	<string>Pingo는 서클 멤버 간의 실시간 도로 위치 공유, 안심 장소(집·학교) 출입 알림 및 귀갓길 안전 공유를 위해 현재 위치 정보를 사용합니다.</string>
+	<string>Pingo???쒗겢 硫ㅻ쾭 媛꾩쓽 ?ㅼ떆媛??꾨줈 ?꾩튂 怨듭쑀, ?덉떖 ?μ냼(吏뫢룻븰援? 異쒖엯 ?뚮┝ 諛?洹媛볤만 ?덉쟾 怨듭쑀瑜??꾪빐 ?꾩옱 ?꾩튂 ?뺣낫瑜??ъ슜?⑸땲??</string>
 	<key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
-	<string>Pingo는 앱이 닫혀 있을 때도 가족에게 실시간 이동 경로와 안심 장소 도착 알림, 긴급 SOS 위치를 정확히 전달하기 위해 위치 정보를 사용합니다.</string>
+	<string>Pingo???깆씠 ?ロ? ?덉쓣 ?뚮룄 媛議깆뿉寃??ㅼ떆媛??대룞 寃쎈줈? ?덉떖 ?μ냼 ?꾩갑 ?뚮┝, 湲닿툒 SOS ?꾩튂瑜??뺥솗???꾨떖?섍린 ?꾪빐 ?꾩튂 ?뺣낫瑜??ъ슜?⑸땲??</string>
 	<key>NSLocationAlwaysUsageDescription</key>
-	<string>Pingo는 안심 장소 출입 감지 및 가족 간 실시간 위치 공유를 위해 백그라운드 위치 정보를 사용합니다.</string>
-	<key>NSMicrophoneUsageDescription</key>
-	<string>Pingo는 서클 멤버에게 3초 실시간 보이스 무전(PTT) 음성을 녹음하여 전송하기 위해 마이크 권한을 사용합니다.</string>
+	<string>Pingo???덉떖 ?μ냼 異쒖엯 媛먯? 諛?媛議?媛??ㅼ떆媛??꾩튂 怨듭쑀瑜??꾪빐 諛깃렇?쇱슫???꾩튂 ?뺣낫瑜??ъ슜?⑸땲??</string>
 	<key>NSPhotoLibraryUsageDescription</key>
-	<string>Pingo는 지도 핀과 멤버 리스트에 표시할 내 프로필 사진을 앨범에서 선택하여 설정하기 위해 사진 보관함 접근 권한을 사용합니다.</string>
+	<string>Pingo??吏???怨?硫ㅻ쾭 由ъ뒪?몄뿉 ?쒖떆?????꾨줈???ъ쭊???⑤쾾?먯꽌 ?좏깮?섏뿬 ?ㅼ젙?섍린 ?꾪빐 ?ъ쭊 蹂닿????묎렐 沅뚰븳???ъ슜?⑸땲??</string>
 	<key>NSCameraUsageDescription</key>
-	<string>Pingo는 내 프로필 아바타 사진을 촬영하여 설정하기 위해 카메라 권한을 사용합니다.</string>
+	<string>Pingo?????꾨줈???꾨컮? ?ъ쭊??珥ъ쁺?섏뿬 ?ㅼ젙?섍린 ?꾪빐 移대찓??沅뚰븳???ъ슜?⑸땲??</string>
 
-	<!-- 백그라운드 위치 및 오디오 무전 재생 유지 -->
+	<!-- 諛깃렇?쇱슫???꾩튂 諛??ㅻ뵒??臾댁쟾 ?ъ깮 ?좎? -->
 	<key>UIBackgroundModes</key>
 	<array>
 		<string>location</string>
-		<string>audio</string>
 		<string>fetch</string>
 	</array>
 </dict>

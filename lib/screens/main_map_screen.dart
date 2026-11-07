@@ -388,9 +388,7 @@ class _MainLife360MapScreenState extends State<MainLife360MapScreen>
             0,
             _allMembers[0].location,
           );
-          _allMembers[0].recentRoute = savedToday.isNotEmpty
-              ? savedToday
-              : [_allMembers[0].location];
+          _allMembers[0].recentRoute = savedToday;
         } else if (_allMembers[i].recentRoute.isEmpty) {
           _allMembers[i].recentRoute = [_allMembers[i].location];
         }
@@ -417,6 +415,10 @@ class _MainLife360MapScreenState extends State<MainLife360MapScreen>
             );
             final rawSpeed = pos.speed.isNaN || pos.speed < 0 ? 0.0 : pos.speed;
             final speedKmh = (rawSpeed * 3.6).clamp(0.0, 200.0);
+            await AppEngineService.instance.recordMyLocationBreadcrumb(
+              newLatLng,
+              speedKmh: speedKmh,
+            );
 
             if (!mounted) return;
             setState(() {
@@ -428,10 +430,18 @@ class _MainLife360MapScreenState extends State<MainLife360MapScreen>
                         ? Icons.directions_walk_rounded
                         : Icons.home_rounded);
               _allMembers[0].statusText = '$addr • ${AppStrings.t('just_now')}';
-              _allMembers[0].recentRoute = [
-                ..._allMembers[0].recentRoute,
-                newLatLng,
-              ];
+              if (_allMembers[0].recentRoute.isEmpty) {
+                _allMembers[0].recentRoute = [newLatLng];
+              } else if (AppEngineService.instance.calculateDistanceMeters(
+                    _allMembers[0].recentRoute.last,
+                    newLatLng,
+                  ) >=
+                  25.0) {
+                _allMembers[0].recentRoute = [
+                  ..._allMembers[0].recentRoute,
+                  newLatLng,
+                ];
+              }
             });
 
             // 자동 장소 알림 (Place Alerts / Geofencing: 진입 150m / 이탈 +30m 완충)
@@ -2740,28 +2750,92 @@ class _MainLife360MapScreenState extends State<MainLife360MapScreen>
                               ? _selectedCustomDateKey
                               : null,
                         );
-                    if (activePts.length < 2) return const SizedBox.shrink();
+                    if (activePts.isEmpty) return const SizedBox.shrink();
 
-                    return PolylineLayer(
-                      polylines: [
-                        Polyline(
-                          points: activePts,
-                          color: AppColors.primaryPurple.withValues(
-                            alpha: 0.22,
+                    final steps = AppEngineService.instance
+                        .buildDetailedTimelineSteps(
+                          activePts,
+                          safePlaces: safePlaces,
+                        );
+                    if (steps.isEmpty) {
+                      return const SizedBox.shrink();
+                    }
+                    return MarkerLayer(
+                      markers: steps.map<Marker>((step) {
+                        final LatLng pt = step['point'] as LatLng;
+                        final int stopNum = (step['stopNumber'] as int?) ?? 1;
+                        final String pName =
+                            (step['placeName'] as String?) ?? '';
+                        return Marker(
+                          point: pt,
+                          width: 150,
+                          height: 34,
+                          child: GestureDetector(
+                            onTap: () => _mapController.move(pt, 16.5),
+                            child: Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Container(
+                                  width: 22,
+                                  height: 22,
+                                  decoration: BoxDecoration(
+                                    color: AppColors.primaryPurple,
+                                    shape: BoxShape.circle,
+                                    border: Border.all(
+                                      color: Colors.white,
+                                      width: 2,
+                                    ),
+                                    boxShadow: const [
+                                      BoxShadow(
+                                        color: Colors.black26,
+                                        blurRadius: 4,
+                                      ),
+                                    ],
+                                  ),
+                                  alignment: Alignment.center,
+                                  child: Text(
+                                    '$stopNum',
+                                    style: const TextStyle(
+                                      color: Colors.white,
+                                      fontSize: 11,
+                                      fontWeight: FontWeight.w900,
+                                    ),
+                                  ),
+                                ),
+                                const SizedBox(width: 4),
+                                Flexible(
+                                  child: Container(
+                                    padding: const EdgeInsets.symmetric(
+                                      horizontal: 7,
+                                      vertical: 2.5,
+                                    ),
+                                    decoration: BoxDecoration(
+                                      color: Colors.white.withValues(
+                                        alpha: 0.95,
+                                      ),
+                                      borderRadius: BorderRadius.circular(8),
+                                      border: Border.all(
+                                        color: AppColors.primaryPurple
+                                            .withValues(alpha: 0.35),
+                                      ),
+                                    ),
+                                    child: Text(
+                                      pName,
+                                      maxLines: 1,
+                                      overflow: TextOverflow.ellipsis,
+                                      style: const TextStyle(
+                                        fontSize: 10.5,
+                                        fontWeight: FontWeight.w800,
+                                        color: AppColors.textDark,
+                                      ),
+                                    ),
+                                  ),
+                                ),
+                              ],
+                            ),
                           ),
-                          strokeWidth: 14.0,
-                        ),
-                        Polyline(
-                          points: activePts,
-                          color: Colors.white,
-                          strokeWidth: 9.0,
-                        ),
-                        Polyline(
-                          points: activePts,
-                          color: AppColors.primaryPurple,
-                          strokeWidth: 5.5,
-                        ),
-                      ],
+                        );
+                      }).toList(),
                     );
                   },
                 ),
@@ -4072,9 +4146,15 @@ class _MainLife360MapScreenState extends State<MainLife360MapScreen>
         activeTabRoute,
       );
       visitedCount = timelineSteps.length;
-      estMinutes = activeTabRoute.length < 2
-          ? 0
-          : (displayDistKm * 6.5 + visitedCount * 4).round();
+      int sumTripMins = 0;
+      for (final dynamic st in timelineSteps) {
+        sumTripMins += (st['tripMinutes'] as int? ?? 0);
+      }
+      estMinutes = sumTripMins > 0
+          ? sumTripMins
+          : (activeTabRoute.length < 2
+                ? 0
+                : (displayDistKm * 6.5 + visitedCount * 4).round());
     }
 
     final int hrs = estMinutes ~/ 60;
@@ -4749,7 +4829,12 @@ class _MainLife360MapScreenState extends State<MainLife360MapScreen>
                       children: List.generate(timelineSteps.length, (idx) {
                         final dynamic step = timelineSteps[idx];
                         final String placeName = step['placeName'] as String;
-                        final double segKm = step['segmentKm'] as double;
+                        final int stopNum =
+                            (step['stopNumber'] as int?) ?? (idx + 1);
+                        final String stayLabel =
+                            (step['stayLabel'] as String?) ?? '';
+                        final String tripLabel =
+                            (step['tripLabel'] as String?) ?? '';
                         final LatLng pt = step['point'] as LatLng;
                         final bool isFirst = idx == 0;
                         final bool isLast = idx == timelineSteps.length - 1;
@@ -4757,6 +4842,46 @@ class _MainLife360MapScreenState extends State<MainLife360MapScreen>
                         return Column(
                           crossAxisAlignment: CrossAxisAlignment.start,
                           children: [
+                            // 1) 이전 체류지에서 현재 체류지까지의 '이동 구간(Trip: 차량/도보)' 표시
+                            if (!isFirst && tripLabel.isNotEmpty)
+                              Padding(
+                                padding: const EdgeInsets.only(
+                                  left: 9,
+                                  top: 2,
+                                  bottom: 2,
+                                ),
+                                child: Row(
+                                  children: [
+                                    Container(
+                                      width: 2,
+                                      height: 22,
+                                      color: AppColors.primaryPurple.withValues(
+                                        alpha: 0.35,
+                                      ),
+                                    ),
+                                    const SizedBox(width: 10),
+                                    Container(
+                                      padding: const EdgeInsets.symmetric(
+                                        horizontal: 8,
+                                        vertical: 2.5,
+                                      ),
+                                      decoration: BoxDecoration(
+                                        color: const Color(0xFFEEF2FF),
+                                        borderRadius: BorderRadius.circular(8),
+                                      ),
+                                      child: Text(
+                                        tripLabel,
+                                        style: const TextStyle(
+                                          fontSize: 10.5,
+                                          fontWeight: FontWeight.w800,
+                                          color: AppColors.primaryPurple,
+                                        ),
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            // 2) '체류/방문 거점(Stay: 번호 + 실제 상호명 + 머무른 시간/현재 상태)' 표시
                             InkWell(
                               onTap: () {
                                 HapticFeedback.selectionClick();
@@ -4764,38 +4889,36 @@ class _MainLife360MapScreenState extends State<MainLife360MapScreen>
                               },
                               child: Padding(
                                 padding: const EdgeInsets.symmetric(
-                                  vertical: 2.5,
+                                  vertical: 4.0,
                                 ),
                                 child: Row(
                                   children: [
-                                    if (isLast)
-                                      const Icon(
-                                        Icons.place_rounded,
-                                        size: 15,
-                                        color: AppColors.primaryPurple,
-                                      )
-                                    else
-                                      Container(
-                                        width: 10,
-                                        height: 10,
-                                        margin: const EdgeInsets.symmetric(
-                                          horizontal: 2.5,
-                                        ),
-                                        decoration: BoxDecoration(
-                                          shape: BoxShape.circle,
-                                          color: isFirst
-                                              ? Colors.white
-                                              : const Color(0xFF9333EA),
-                                          border: isFirst
-                                              ? Border.all(
-                                                  color:
-                                                      AppColors.primaryPurple,
-                                                  width: 2.2,
-                                                )
-                                              : null,
+                                    Container(
+                                      width: 20,
+                                      height: 20,
+                                      decoration: BoxDecoration(
+                                        shape: BoxShape.circle,
+                                        color: isLast
+                                            ? AppColors.primaryPurple
+                                            : Colors.white,
+                                        border: Border.all(
+                                          color: AppColors.primaryPurple,
+                                          width: 2,
                                         ),
                                       ),
-                                    const SizedBox(width: 7),
+                                      alignment: Alignment.center,
+                                      child: Text(
+                                        '$stopNum',
+                                        style: TextStyle(
+                                          fontSize: 10,
+                                          fontWeight: FontWeight.w900,
+                                          color: isLast
+                                              ? Colors.white
+                                              : AppColors.primaryPurple,
+                                        ),
+                                      ),
+                                    ),
+                                    const SizedBox(width: 8),
                                     Expanded(
                                       child: Text(
                                         isLast && cleanAddress.isNotEmpty
@@ -4804,23 +4927,21 @@ class _MainLife360MapScreenState extends State<MainLife360MapScreen>
                                         maxLines: 1,
                                         overflow: TextOverflow.ellipsis,
                                         style: TextStyle(
-                                          fontSize: isLast ? 12.5 : 11.5,
+                                          fontSize: isLast ? 12.5 : 12.0,
                                           fontWeight: isLast
-                                              ? FontWeight.w800
+                                              ? FontWeight.w900
                                               : FontWeight.w700,
-                                          color: isFirst
-                                              ? AppColors.textGray
-                                              : AppColors.textDark,
+                                          color: AppColors.textDark,
                                         ),
                                       ),
                                     ),
                                     const SizedBox(width: 6),
                                     Text(
-                                      isFirst
-                                          ? '${AppStrings.t('timeline_max_speed')} ${AppEngineService.instance.getMaxSpeedForMemberTab(member.id, _selectedHistoryDayTab, member.speedKmh).toStringAsFixed(0)}km/h'
-                                          : (isLast
-                                                ? elapsedText
-                                                : '+${segKm.toStringAsFixed(1)}km'),
+                                      isLast
+                                          ? elapsedText
+                                          : (isFirst
+                                                ? AppStrings.t('status_staying')
+                                                : stayLabel),
                                       style: TextStyle(
                                         fontSize: 11,
                                         fontWeight: FontWeight.w700,
@@ -4833,19 +4954,6 @@ class _MainLife360MapScreenState extends State<MainLife360MapScreen>
                                 ),
                               ),
                             ),
-                            if (!isLast)
-                              Padding(
-                                padding: const EdgeInsets.only(
-                                  left: 6.8,
-                                  top: 1,
-                                  bottom: 1,
-                                ),
-                                child: Container(
-                                  width: 1.5,
-                                  height: 10,
-                                  color: const Color(0xFFCBD5E1),
-                                ),
-                              ),
                           ],
                         );
                       }),
